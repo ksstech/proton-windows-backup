@@ -1,0 +1,7 @@
+# Runtime files -- never commit these
+proton-drive.exe
+win_backup.log
+win_restore.log
+
+# Manifest directory -- auto-generated on every run
+.backup-manifest/
