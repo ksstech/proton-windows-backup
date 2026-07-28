@@ -76,11 +76,35 @@ if ($InstallTask) {
 
     $action  = New-ScheduledTaskAction -Execute $pwshExe `
                    -Argument "-NonInteractive -WindowStyle Hidden -File `"$PSCommandPath`""
+
+    # Trigger: Sunday 23:00, with a WakeToRun-friendly random delay window disabled.
     $trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Sunday -At '23:00'
+
+    # POWER MANAGEMENT -- CRITICAL FOR LAPTOPS
+    # Root cause of missed runs on a laptop that is always on AC power but
+    # sleeps (screen off / idle): at 23:00 the CPU is asleep, so an
+    # Interactive task with WakeToRun=False cannot fire. It misses the slot,
+    # then a catch-up run starts when the machine briefly wakes -- and is
+    # terminated when it sleeps again (LastTaskResult 0x40010004 =
+    # DBG_TERMINATE_PROCESS).
+    #
+    #   -WakeToRun                  : wake the machine at 23:00 to run the task
+    #   -DontStopIfGoingOnBatteries : a run that STARTED on AC finishes even if
+    #                                 the charger is briefly pulled mid-backup
+    #   DisallowStartIfOnBatteries  : left True -- do NOT start a fresh run on
+    #                                 battery (Task Scheduler has no percentage
+    #                                 threshold; this is the closest to "only
+    #                                 on power"). Harmless here since the
+    #                                 machine is always on AC.
+    #
+    # NOTE: WakeToRun requires the AC power plan to allow wake timers AND to
+    # not hard-sleep the CPU. See RUNBOOK phase 5 for the powercfg commands.
     $settings = New-ScheduledTaskSettingsSet `
                     -ExecutionTimeLimit (New-TimeSpan -Hours 2) `
                     -StartWhenAvailable `
-                    -RunOnlyIfNetworkAvailable
+                    -RunOnlyIfNetworkAvailable `
+                    -DontStopIfGoingOnBatteries `
+                    -WakeToRun
     $principal = New-ScheduledTaskPrincipal `
                     -UserId "$env:USERDOMAIN\$env:USERNAME" `
                     -LogonType Interactive `
@@ -102,7 +126,7 @@ if ($InstallTask) {
         Write-Host ""
         Write-Host "  Requires Administrator. Right-click your terminal and choose"
         Write-Host "  'Run as Administrator', then run:"
-        Write-Host "    cd ~\proton-backup"
+        Write-Host "    cd ~\proton-windows-backup"
         Write-Host "    .\win_backup.ps1 -InstallTask"
         Write-Host ""
         exit 1

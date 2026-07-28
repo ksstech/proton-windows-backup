@@ -222,10 +222,46 @@ cd ~\proton-windows-backup
 This creates the task with LogonType = Interactive -- required for Credential
 Manager access. Do NOT change it to "Run whether user is logged on or not".
 
-### 5.9 Verify task
+The task is installed with laptop-friendly power settings: WakeToRun = True,
+DontStopIfGoingOnBatteries = True, DisallowStartIfOnBatteries = True (won't
+start a fresh run on battery, but a run started on AC finishes).
+
+### 5.9 Configure AC power plan (CRITICAL for a laptop that sleeps)
+
+The scheduled task cannot run while the CPU is asleep. On a laptop that is
+always on AC but sleeps when the screen is off, the 23:00 run is missed and a
+catch-up run gets terminated when the machine sleeps again (LastTaskResult
+0x40010004). Two settings make the AC power plan safe for scheduled backups.
+
+Run as Administrator:
 
 ```powershell
-Get-ScheduledTask -TaskName 'Proton Drive - Win11 PZ13 Backup' | Select *
+# 1. Never sleep or hibernate while on AC power (screen may still turn off)
+powercfg /change standby-timeout-ac 0
+powercfg /change hibernate-timeout-ac 0
+
+# 2. Allow wake timers on AC so WakeToRun can fire the 23:00 task
+powercfg /setacvalueindex SCHEME_CURRENT SUB_SLEEP RTCWAKE 1
+powercfg /setactive SCHEME_CURRENT
+```
+
+Verify:
+
+```powershell
+powercfg /query SCHEME_CURRENT SUB_SLEEP STANDBYIDLE   # AC value should be 0
+powercfg /query SCHEME_CURRENT SUB_SLEEP RTCWAKE        # AC value should be 1
+```
+
+Leaving `standby-timeout-ac 0` means the machine stays fully awake (screen off
+is fine) whenever it is plugged in, so the weekly task always fires on time.
+Battery timeouts are untouched, so unplugged behaviour is unchanged.
+
+### 5.10 Verify task
+
+```powershell
+$t = Get-ScheduledTask -TaskName 'Proton Drive - Win11 PZ13 Backup'
+$t | Select-Object TaskName, State
+$t.Settings | Format-List WakeToRun, DisallowStartIfOnBatteries, StopIfGoingOnBatteries, StartWhenAvailable
 ```
 
 ---
