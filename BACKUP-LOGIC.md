@@ -140,7 +140,14 @@ After each upload:
 1. List the remote folder using `--json` for clean output
 2. Filter for files matching the archive name pattern
 3. Sort by name (ISO date names sort chronologically)
-4. If count > KEEP_COUNT, delete the oldest (count - KEEP_COUNT) archives
+4. If count > KEEP_COUNT, **trash** the oldest (count - KEEP_COUNT) archives, then run a
+   single `filesystem empty-trash`
+
+**`filesystem delete` does not work on active files** — it only permanently removes items
+already in the trash ("You can permanently delete items only from trash. Trash your files
+first."). The working retention mechanism on both platforms is therefore `filesystem trash
+<path>` per archive, followed by one `filesystem empty-trash` after the loop. (`empty-trash`
+empties the whole account trash — fine for a dedicated backup account.)
 
 The `--json` flag on `filesystem list` returns a JSON array; this is parsed directly
 (with `jq` on Linux, `ConvertFrom-Json` on Windows) rather than parsing human-readable
@@ -151,6 +158,16 @@ different terminal widths.
 object, not a plain string: `{"ok": true, "value": "filename.tar.gz"}`. Always access
 the filename as `.name.value`. The size field is `totalStorageSize` (bytes) and
 modification time is `modificationTime`.
+
+---
+
+## Heartbeat (dead-man's-switch)
+
+After a successful run, both scripts write a UTC ISO-8601 timestamp to `.last_success` in
+the backup directory, and optionally ping a `HEARTBEAT_URL` (taken from the environment or
+a `HEARTBEAT_URL=...` line in a `.env` file in the directory). A missed or failed run
+otherwise fails silently — the local timestamp (and the optional external ping) make a
+silently missed week detectable in days instead of weeks.
 
 ---
 
