@@ -177,15 +177,18 @@ if (-not (Get-Command tar -ErrorAction SilentlyContinue)) {
 
 # Quick connectivity check -- also validates Credential Manager access
 Log "Pre-flight: verifying Proton Drive connection..."
-try {
-    $null = & $PROTON filesystem list $REMOTE_BASE --json 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        # Folder might not exist yet -- try to create it
-        Log "Remote folder not found -- attempting to create $REMOTE_BASE ..."
-        & $PROTON filesystem create-folder /my-files PZ13 2>&1 | ForEach-Object { Log $_ }
-    }
-} catch {
-    Fail "Cannot reach Proton Drive. Check authentication: .\proton-drive.exe auth login"
+# Detect an invalid/expired auth token explicitly and fail fast, rather than
+# masking it as "folder doesn't exist" and burning minutes building a 365 MB
+# archive that then can't upload. proton-drive can leave a stale token (see the
+# libsecret Replace=False bug noted in the shared CLAUDE.md / BUG-REPORT).
+$authCheck  = & $PROTON filesystem list $REMOTE_BASE --json 2>&1
+$authStatus = $LASTEXITCODE
+if ($authCheck -match 'need to login|not authenticated|unauthorized') {
+    Fail "proton-drive auth token invalid/expired -- run: .\proton-drive.exe auth login (see RUNBOOK)"
+} elseif ($authStatus -ne 0) {
+    # Folder might not exist yet -- try to create it
+    Log "Remote folder not found -- attempting to create $REMOTE_BASE ..."
+    & $PROTON filesystem create-folder /my-files PZ13 2>&1 | ForEach-Object { Log $_ }
 }
 Ok "Proton Drive connection verified"
 
@@ -292,17 +295,30 @@ if (-not $remoteItems) {
     if ($total -gt $KEEP_COUNT) {
         $deleteCount = $total - $KEEP_COUNT
         Log "Removing $deleteCount old backup(s)..."
+        # NOTE: `filesystem delete` only permanently removes items ALREADY in
+        # trash ("You can permanently delete items only from trash. Trash your
+        # files first.") -- so it silently fails on active backups. The working
+        # mechanism is `trash <path>` per file, then a single `empty-trash`.
+        # NOTE: empty-trash empties the WHOLE account trash, not just these
+        # files -- fine for a dedicated backup account.
         $backups | Select-Object -First $deleteCount | ForEach-Object {
             $fname       = $_.name.value
             $remotePath  = "$REMOTE_BASE/$fname"
-            Log "  Deleting: $remotePath"
-            $delOut = & $PROTON filesystem delete $remotePath 2>&1
+            Log "  Trashing: $remotePath"
+            $delOut = & $PROTON filesystem trash $remotePath 2>&1
             $delOut | ForEach-Object { Log "    $_" }
             if ($LASTEXITCODE -eq 0) {
-                Ok "Deleted: $fname"
+                Ok "Trashed: $fname"
             } else {
-                Warn "Could not delete $remotePath -- may need manual cleanup"
+                Warn "Could not trash $remotePath -- may need manual cleanup"
             }
+        }
+        $emptyOut = & $PROTON filesystem empty-trash 2>&1
+        $emptyOut | ForEach-Object { Log "    $_" }
+        if ($LASTEXITCODE -eq 0) {
+            Ok "Trash emptied"
+        } else {
+            Warn "Could not empty trash -- check Proton Drive quota manually"
         }
     } else {
         Ok "Retention OK - $total of $KEEP_COUNT slots used"
@@ -330,6 +346,32 @@ try {
 Log "========================================================"
 Log "Backup COMPLETE - $BACKUP_LABEL ($archiveSizeHR)"
 Log "========================================================"
+
+# -----------------------------------------------------------------------------
+# STEP 6 -- HEARTBEAT (dead-man's-switch)
+# -----------------------------------------------------------------------------
+# A missed or failed run otherwise fails silently -- nothing checks that this
+# script ran at all. Write a local UTC timestamp every successful run, and
+# optionally ping an external monitor if HEARTBEAT_URL is set (in the
+# environment, or as a HEARTBEAT_URL=... line in a .env file in this
+# directory). Mirrors rpi_backup.sh's heartbeat exactly (same .last_success
+# filename, same UTC ISO-8601 format) so both platforms are monitored alike.
+$heartbeatStamp = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
+Set-Content -Path (Join-Path $PSScriptRoot '.last_success') -Value $heartbeatStamp -Encoding ascii -NoNewline
+$heartbeatUrl = $env:HEARTBEAT_URL
+$envFile = Join-Path $PSScriptRoot '.env'
+if (Test-Path $envFile) {
+    $line = Get-Content $envFile | Where-Object { $_ -match '^\s*HEARTBEAT_URL\s*=' } | Select-Object -First 1
+    if ($line) { $heartbeatUrl = ($line -split '=', 2)[1].Trim().Trim('"').Trim("'") }
+}
+if ($heartbeatUrl) {
+    try {
+        Invoke-WebRequest -Uri $heartbeatUrl -TimeoutSec 10 -UseBasicParsing -ErrorAction Stop | Out-Null
+        Ok "Heartbeat sent"
+    } catch {
+        Warn "Heartbeat URL unreachable -- check network/monitor config"
+    }
+}
 
 Write-Host ""
 Write-Host "  Backup complete: $BACKUP_LABEL ($archiveSizeHR)"
