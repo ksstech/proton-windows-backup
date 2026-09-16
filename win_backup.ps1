@@ -7,6 +7,9 @@
 #   (critical: "run when user is logged on" allows Credential Manager access)
 #
 # WHAT IT DOES
+#   0. Checks for a newer Proton Drive CLI (winget), smoke-tests and installs
+#      it before anything else depends on the binary -- auto-rollback on any
+#      failure, never blocks the backup itself. See "STEP 0" below.
 #   1. Runs win_audit.ps1 to update the include/exclude manifest
 #   2. Creates a tar.gz archive of everything in include.txt
 #      minus everything in exclude.txt
@@ -173,6 +176,116 @@ if (-not (Test-Path $AUDIT))   { Fail "win_audit.ps1 not found at $AUDIT" }
 # Verify tar.exe is available (built into Windows 10/11)
 if (-not (Get-Command tar -ErrorAction SilentlyContinue)) {
     Fail "tar.exe not found. Required: Windows 10 build 17063 or later."
+}
+
+# -----------------------------------------------------------------------------
+# STEP 0 -- CHECK FOR / INSTALL A NEWER PROTON DRIVE CLI
+# -----------------------------------------------------------------------------
+# Cheap check first (winget show, no download), then download+verify+smoke-test
+# +promote only if actually newer -- avoids re-fetching a ~120MB binary every
+# week just to find it's already current. `winget show`/`winget download`
+# resolve the same official Proton AG package, same binary/URL Proton
+# publishes directly, hash-verified by winget itself (confirmed live
+# 2026-09-16 on this machine). Self-contained and non-fatal: any failure here
+# warns and leaves the PREVIOUS binary in place, then Step 1 onward proceeds
+# normally -- an update problem must never be the reason a weekly backup is
+# missed. Same shape (staged download, checksum, smoke-test with a real
+# authenticated call before promotion, .bak kept until the live binary is
+# re-verified, auto-rollback) as the RPi's own proven auto-install, which
+# lives in the separate xware-update repo, not this one -- see
+# z-repo/proton-drive/CLAUDE.md's "Proton Drive CLI" section.
+Log "--- Step 0: Check for Proton Drive CLI update ---"
+
+if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+    Warn "winget not available -- skipping CLI update check"
+} else {
+    $currentVer = $null
+    foreach ($line in (& $PROTON --version 2>$null)) {
+        if ($line -match '(\d+\.\d+\.\d+)') { $currentVer = $Matches[1]; break }
+    }
+
+    $latestVer = $null
+    $showOutput = winget show --id Proton.ProtonDrive.CLI --accept-source-agreements 2>&1
+    foreach ($line in $showOutput) {
+        if ($line -match '^Version:\s*(\S+)') { $latestVer = $Matches[1]; break }
+    }
+
+    if (-not $currentVer) {
+        Warn "Could not read the currently installed CLI version -- skipping update check (pre-flight below will catch a broken binary)"
+    } elseif (-not $latestVer) {
+        Warn "Could not determine the latest Proton Drive CLI version via winget -- skipping this run"
+    } elseif ($latestVer -eq $currentVer) {
+        Ok "Proton Drive CLI is current ($currentVer)"
+    } else {
+        Log "Proton Drive CLI update available: installed=$currentVer latest=$latestVer -- starting staged install"
+
+        $stageDir = Join-Path $env:TEMP "proton-drive-update-$BACKUP_DATE"
+        # $env:TEMP, not $PSScriptRoot: win_audit.ps1 excludes AppData/Local/Temp
+        # from the backup, so a stray staged file here can never get archived --
+        # the same class of mistake that nearly doubled a backup's size once
+        # already when a .bak was left inside the backed-up directory (see
+        # history/cli-version-checking-and-upgrades.md).
+        if (Test-Path $stageDir) { Remove-Item $stageDir -Recurse -Force }
+        New-Item -ItemType Directory -Path $stageDir -Force | Out-Null
+
+        $downloadOutput = winget download --id Proton.ProtonDrive.CLI --download-directory $stageDir `
+            --accept-source-agreements --accept-package-agreements 2>&1
+        $downloadOutput | ForEach-Object { Log "  winget: $_" }
+
+        $staged = Get-ChildItem $stageDir -Filter '*.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+
+        if (-not $staged) {
+            Warn "winget download did not produce a binary -- aborting update, live binary untouched"
+        } else {
+            # Smoke test BEFORE touching the live binary: an interactive-looking
+            # --version pass does not prove auth works the way this script
+            # actually invokes the binary -- run the real call it's about to use.
+            & $staged.FullName filesystem list $REMOTE_BASE 2>&1 | ForEach-Object { Log "  smoke-test: $_" }
+            if ($LASTEXITCODE -ne 0) {
+                Warn "Staged proton-drive v$latestVer failed to authenticate/list $REMOTE_BASE -- aborting update, live binary untouched"
+            } else {
+                Ok "Smoke-test OK: staged binary v$latestVer authenticates and lists $REMOTE_BASE"
+
+                $bakPath = "$PROTON.bak"
+                Copy-Item $PROTON $bakPath -Force
+                Copy-Item $staged.FullName $PROTON -Force
+
+                & $PROTON filesystem list $REMOTE_BASE 2>&1 | Out-Null
+                if ($LASTEXITCODE -eq 0) {
+                    Remove-Item $bakPath -Force
+                    Ok "Proton Drive CLI upgraded: $currentVer -> $latestVer"
+
+                    # Step (e): tell the RPi's tracking table, so the weekly
+                    # xware-update email stops flagging PZ13 as outstanding.
+                    # Soft-fails -- an unreachable RPi must not block this backup.
+                    $sshKey = Join-Path $env:USERPROFILE '.ssh\workstation-to-rpi'
+                    if (Test-Path $sshKey) {
+                        & ssh -o BatchMode=yes -o ConnectTimeout=5 -i $sshKey vh@192.168.1.6 `
+                            "~/xware-update-checks/xware-ack proton-drive-cli/windows-arm64 $latestVer" 2>&1 |
+                            ForEach-Object { Log "  xware-ack: $_" }
+                        if ($LASTEXITCODE -eq 0) {
+                            Ok "RPi tracking updated: proton-drive-cli/windows-arm64 = $latestVer"
+                        } else {
+                            Warn "Could not reach RPi to update its tracking -- do it by hand: ssh rpi ""~/xware-update-checks/xware-ack proton-drive-cli/windows-arm64 $latestVer"""
+                        }
+                    } else {
+                        Warn "SSH key not found at $sshKey -- update the RPi's tracking by hand: xware-ack proton-drive-cli/windows-arm64 $latestVer"
+                    }
+                } else {
+                    Warn "Post-promotion verification FAILED for v$latestVer -- rolling back to $currentVer"
+                    Copy-Item $bakPath $PROTON -Force
+                    & $PROTON filesystem list $REMOTE_BASE 2>&1 | Out-Null
+                    if ($LASTEXITCODE -eq 0) {
+                        Remove-Item $bakPath -Force
+                        Ok "Rollback to $currentVer succeeded -- proton-drive authenticating again"
+                    } else {
+                        Fail "ROLLBACK ALSO FAILED -- proton-drive CLI may be broken. Manual intervention needed. Backup copy retained at $bakPath"
+                    }
+                }
+            }
+        }
+        Remove-Item $stageDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
 
 # Quick connectivity check -- also validates Credential Manager access
