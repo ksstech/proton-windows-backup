@@ -2,13 +2,15 @@
 # Run-Tests.ps1 -- run one test suite, write the results to tests\results\
 #
 # USAGE (PowerShell 7; a normal window unless the suite says otherwise)
-#   pwsh -NoProfile -File <repo>\tests\Run-Tests.ps1 -Suite <name> [-AllowRemote] [-KeepWorkDir]
+#   pwsh -NoProfile -File <repo>\tests\Run-Tests.ps1 -Suite <name> [-AllowRemote] [-AllowUpload] [-KeepWorkDir]
 #
 # A suite is tests\suites\<name>.ps1. It returns a hashtable:
 #   Name, Description   text
 #   RequiresAdmin       $true: refuse to run unless elevated
 #   RequiresRemote      $true: refuse to run unless -AllowRemote is given.
 #                       Remote access in a suite must be read-only (list/download).
+#   RequiresUpload      $true: the suite runs a real backup (upload + retention);
+#                       refuse to run unless -AllowUpload is given.
 #   Setup   = { param($Ctx) ... }   optional; a failure skips every test
 #   Tests   = @( @{
 #       Id, Name
@@ -40,6 +42,7 @@
 param(
     [Parameter(Mandatory = $true)][string]$Suite,
     [switch]$AllowRemote,
+    [switch]$AllowUpload,
     [switch]$KeepWorkDir
 )
 
@@ -87,6 +90,7 @@ $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIden
                [Security.Principal.WindowsBuiltInRole]::Administrator)
 if ($def.RequiresAdmin -and -not $isAdmin) { Stop-Run "Suite $Suite needs an Administrator PS7 window" }
 if ($def.RequiresRemote -and -not $AllowRemote) { Stop-Run "Suite $Suite reads Proton Drive; add -AllowRemote" }
+if ($def.RequiresUpload -and -not $AllowUpload) { Stop-Run "Suite $Suite runs a real backup (upload, retention); add -AllowUpload" }
 
 New-Item -ItemType Directory -Path $WorkDir    -Force | Out-Null
 New-Item -ItemType Directory -Path $ResultsDir -Force | Out-Null

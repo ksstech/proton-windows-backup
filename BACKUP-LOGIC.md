@@ -155,6 +155,10 @@ It makes no archive, so it can be run on its own to inspect what would be backed
 
 `win_backup.ps1` order (step names as in the log):
 
+- Scheduled runs only: is a backup due, does power allow it? If not, exit (see "Schedule and
+  Power")
+- One run at a time (a mutex); a second run exits at once
+- Keep-awake power request, held until the process exits
 - Pre-flight: CLI, GNU tar and gzip present
 - Step 0: `winget upgrade` of the CLI (non-fatal)
 - Pre-flight: Proton Drive connection and auth
@@ -223,11 +227,6 @@ here-string, so `$Temp` and `$RECYCLE.BIN` are written literally (see "Incidents
 - `AppData\Local` apart from anything listed above
 - OneDrive (already in the cloud)
 - The ESP-IDF SDK clones (above)
-- **`C:\Users\andre\DevSpace` — TODO.** Local disk since 2026-09 (it used to sit inside the
-  Proton Drive sync folder). It is not in `include.txt`, so on PZ13 it is protected only by
-  what has been pushed to GitHub: uncommitted work, unpushed branches and non-git folders
-  under DevSpace are in no backup. Deliberately excluded for now; measure its size, then
-  decide. Tracked in `../CLAUDE.md`.
 
 ---
 
@@ -286,21 +285,71 @@ noticed by checking `.last_success` (RUNBOOK Phase 2).
 
 ## Schedule and Power
 
-Task `Proton Drive - Win11 PZ13 Backup`, created by `win_backup.ps1 -InstallTask`
-(Administrator). Values read back from the registered task on 2026-09-28:
+### What Windows allows (Microsoft Learn, checked 2026-09-28)
+
+- PZ13 is a Modern Standby laptop. Once standby has passed its "desktop activity moderator"
+  phase, **Windows does not let desktop apps run for the rest of standby.** The backup runs
+  in the user's session (it has to, for Credential Manager), so it cannot run while PZ13 is
+  asleep. A wake timer does not change this. This is why the 23:00 wake-and-run design kept
+  failing: runs started, were paused, and were later killed (see "Known Issue" below).
+- A **power request** (`PowerSetRequest`, `PowerRequestSystemRequired`) stops the machine
+  entering standby by idling out: on AC for as long as it is held, on battery for at most
+  5 minutes after the sleep timeout. PZ13's sleep timeout is Never on AC and on battery.
+- Power requests end on **lid close, power button, or Start > Sleep.** Nothing a program
+  does prevents that.
+
+Sources: `PowerSetRequest` remarks; "Prepare software for modern standby" (both
+learn.microsoft.com).
+
+### The design
+
+A backup is **due** once a week, from **Sunday 23:00**: when `.last_success` is older than
+the most recent Sunday 23:00. The task gives the script many chances to run; the script
+decides.
+
+- Task triggers: **every hour**, **at logon**, **at unlock**. Each starts
+  `win_backup.ps1 -Scheduled`.
+- `-Scheduled` checks, in order:
+  1. Not due: exit at once, nothing logged (the normal hourly case).
+  2. On battery below 50% (`$MIN_BATTERY_PCT`): one log line
+     `Scheduled check: SKIP battery below 50%: ...`, exit. The next trigger tries again.
+  3. Otherwise run, and log `Scheduled run: RUN: last success ..., due since ..., power ...`.
+- Every run, scheduled or manual, holds a power request (system required + execution
+  required, reason `Proton Drive backup (win_backup.ps1)`) until the process exits. So once
+  a backup has started while the machine is awake, idle sleep waits for it.
+- Result: a backup runs on the first awake hour, logon or unlock after Sunday 23:00 with AC
+  or at least 50% battery. A missed week is caught up the same way. A run started on AC
+  finishes if unplugged.
+- A run is only interrupted by closing the lid or pressing the power button. It is then
+  paused, and resumes when the machine wakes (the 12-hour limit leaves room for that). If it
+  fails instead, `.last_success` is not written, so the next trigger retries.
+- Only one run at a time (a named mutex, `Local\ProtonDrive-PZ13-Backup`). Before building
+  an archive, the run stops any GNU `tar` still writing a `win11-pz13-*` archive — left
+  behind by an earlier run that was killed (August 2026, and 2026-09-20).
+- Manual runs (`win_backup.ps1` without `-Scheduled`) always run, whatever the date or
+  battery.
+- `win_backup.ps1 -DecisionOnly` prints the decision and changes nothing;
+  `-SimulatePower AC|<pct>` and `-SimulateLastSuccess <time>` replace the real values (tests).
+
+### The task
+
+`Proton Drive - Win11 PZ13 Backup`, created by `win_backup.ps1 -InstallTask`
+(Administrator). Values read back from the registered task on 2026-09-28
+(`schedule-power` S01):
 
 | Setting | Value | Why |
 |---|---|---|
-| Trigger | Weekly, Sunday 23:00 | |
-| Action | `<full path of pwsh.exe> -NonInteractive -WindowStyle Hidden -File "<repo>\win_backup.ps1"` — the path is resolved with `Get-Command pwsh` when `-InstallTask` runs | PATH is not reliable in a task |
+| Triggers | Time trigger repeating every hour (`PT1H`, for 3650 days); at logon; at session unlock (state 8) | many chances to run while awake |
+| Action | `<full path of pwsh.exe> -NonInteractive -WindowStyle Hidden -File "<repo>\win_backup.ps1" -Scheduled` — the path is resolved with `Get-Command pwsh` when `-InstallTask` runs | PATH is not reliable in a task |
 | Logon type | Interactive | Credential Manager access |
 | Run level | Highest | |
-| Execution time limit | 2 hours (`PT2H`) | |
-| StartWhenAvailable | True | catch-up run after a missed trigger |
+| Execution time limit | 12 hours (`PT12H`) | a run paused by lid close must not be killed on resume |
+| StartWhenAvailable | True | a trigger missed while asleep runs on wake |
 | RunOnlyIfNetworkAvailable | True | |
-| WakeToRun | True | |
-| DisallowStartIfOnBatteries | True | no fresh run on battery |
-| StopIfGoingOnBatteries | False | a run started on AC finishes |
+| WakeToRun | False | a Modern Standby wake does not let the backup run; it only started runs that were then paused |
+| DisallowStartIfOnBatteries | False | the script applies the 50% threshold |
+| StopIfGoingOnBatteries | False | a started run finishes |
+| MultipleInstances | IgnoreNew | |
 
 If PowerShell 7 is installed under `C:\Program Files\WindowsApps\`, that path contains the
 version. After a PowerShell upgrade, re-run `-InstallTask` if the task stops starting (check
@@ -319,9 +368,9 @@ also Never; that was not set by this project.
 
 ---
 
-## Known Issue — Runs Suspended Under Modern Standby (open)
+## Modern Standby — Runs Suspended (redesigned 2026-09-28)
 
-Scheduled runs still fail irregularly although the task and AC power settings are correct.
+Scheduled runs under the old design (Sunday 23:00, `WakeToRun`, 2-hour limit):
 
 - **2026-09-20:** started 23:38, a catch-up for the 23:00 slot. The log stops at
   `Running tar...`. The orphaned `tar` kept writing the archive until 2026-09-22 00:00; it
@@ -330,8 +379,11 @@ Scheduled runs still fail irregularly although the task and AC power settings ar
   line is 03:27:43; the run stopped in Step 0. `LastTaskResult` `0x8007042B` (process
   terminated unexpectedly).
 
-Both fit the process being suspended and later killed while the machine is in Modern
-Standby. Open — TODO in `../CLAUDE.md`. Earlier incidents and the diagnosis method:
+Both fit what Microsoft documents: a desktop process started or running during Modern
+Standby is paused, and the task later killed it. Replaced on 2026-09-28 by the design in
+"Schedule and Power". Tested with the machine awake on AC (see Test Status). Whether it
+catches up as intended after a real night in standby is known only after the next Sunday;
+check with RUNBOOK Phase 2. Earlier incidents and the diagnosis method:
 `../history/scheduled-task-missed-runs.md`.
 
 ---
@@ -403,8 +455,9 @@ task (RUNBOOK).
 `tests\Run-Tests.ps1 -Suite <name>` runs one suite and writes every step (command, exit code,
 output, duration, PASS/FAIL/INFO/SKIP) to `tests\results\<suite>-<run>.json` and `.txt`.
 Suites write only to their own temp folder, which is removed afterwards; environment changes
-stay inside the runner's process. Suites that touch Proton Drive need `-AllowRemote` and are
-read-only; suites that need Administrator refuse to run without it. A run that is refused or
+stay inside the runner's process. Suites that read Proton Drive need `-AllowRemote` and are
+read-only; the one suite that runs a real backup (upload, retention) needs `-AllowUpload`.
+Suites that need Administrator refuse to run without it. A run that is refused or
 interrupted says so in its results file.
 
 | Suite | Checks | Proton Drive |
@@ -414,6 +467,8 @@ interrupted says so in its results file.
 | `archiver-round3` | Explains every file-list difference; lists junctions | no |
 | `backup-local` | `win_backup.ps1 -ArchiveOnly`, manifest checks, archive contents | no |
 | `restore-remote` | Scheduled-run result, then `list`, `check` (latest and by date), `browse`, `restore staging`, `restore packages -DryRun` | read-only; Administrator |
+| `schedule-power` | Task definition read back; due/battery decisions (simulated); keep-awake request seen in `powercfg /requests` during a run and gone after; a not-due task run does nothing | no; Administrator |
+| `scheduled-run` | Makes a backup due (`.last_success` set 8 days back), lets the task run it; request held, COMPLETE, `.last_success` renewed | **uploads** (`-AllowUpload`); Administrator |
 
 Results files are local (gitignored); the figures that matter are recorded in this file and
 in `../history/pz13-archive-integrity-2026-09.md`.
@@ -438,7 +493,12 @@ to `tests\results\` files on PZ13.
 | Retention: trash oldest + `empty-trash` | Tested (08-25 trashed, trash emptied) | log 14:05:59 |
 | Same-day re-run replaces the archive (`-f replace`) | Tested | log, several runs on 2026-09-28 |
 | `.last_success` written | Tested | `restore-remote` R00 |
-| Registered task settings | Tested (read back) | table above |
+| Registered task settings (hourly/logon/unlock, `-Scheduled`, battery, no wake, 12 h) | Tested (read back) | `schedule-power-20260928-214840` S01 |
+| Due / battery decision: after Sunday 23:00 skip, just before run, never run, battery 30% skip, 50% and 80% run | Tested (simulated values) | `schedule-power` S02–S07 |
+| Keep-awake request: listed under SYSTEM and EXECUTION in `powercfg /requests` during a run, gone after | Tested | `schedule-power` S09; `scheduled-run` T01 (inside the task) |
+| Task run when not due: result 0 in 4 s, no log lines, `.last_success` unchanged | Tested | `schedule-power` S10 |
+| Task run when due: `Scheduled run: RUN`, COMPLETE in 2.3 min, `.last_success` renewed | Tested (on AC) | `scheduled-run-20260928-215026` T01 |
+| Battery skip inside a real task run; run on battery; catch-up after a night in standby; stale-tar cleanup | Not tested | needs battery below 50%, or a real Sunday night; next Sunday shows the catch-up |
 | `#Requires -Version 7.0` refuses Windows PowerShell 5.1 | Tested (refused) | manual |
 | GNU tar with Unicode names: create, list, extract, SHA-256 | Tested | `archiver-round1`, `archiver-round2` B06, `restore-remote` R06 |
 | `restore`: `list`, `check latest`, `check <date>`, `browse`, `restore staging <filter>`, `restore packages -DryRun` | Tested | `restore-remote-20260928-185144`, 8/8 PASS |

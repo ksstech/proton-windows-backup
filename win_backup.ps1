@@ -10,7 +10,15 @@
 #   Archives are made with GNU tar from Git for Windows -- see $TAR below.
 #
 # SCHEDULE -- installed with -InstallTask (Administrator):
-#   Sunday 23:00, LogonType Interactive (required for Credential Manager access)
+#   A backup is due once a week, from Sunday 23:00. The task starts
+#   win_backup.ps1 -Scheduled every hour, at logon and at unlock; the script
+#   exits at once unless a backup is due and power allows (AC, or battery at
+#   or above $MIN_BATTERY_PCT). A missed week is caught up the next time the
+#   machine is awake. LogonType Interactive (Credential Manager access).
+#   While running, the script holds a Windows power request so the machine
+#   does not go to sleep. Windows cannot run the backup while PZ13 is in
+#   Modern Standby (desktop apps are paused), and a power request does not
+#   survive lid close / power button / Start > Sleep. See BACKUP-LOGIC.md.
 #
 # WHAT IT DOES
 #   0. winget upgrade of the Proton Drive CLI (non-fatal)
@@ -34,6 +42,12 @@
 #                                   # Proton Drive access, no upload, no
 #                                   # retention, no .last_success. The archive
 #                                   # is left in %TEMP% for inspection.
+#   .\win_backup.ps1 -Scheduled     # what the task runs: back up only if due
+#                                   # and power allows
+#   .\win_backup.ps1 -DecisionOnly  # test: print what -Scheduled would decide,
+#                                   # change nothing. -SimulatePower AC|<pct>
+#                                   # and -SimulateLastSuccess <UTC ISO time>
+#                                   # replace the real values.
 # =============================================================================
 
 #Requires -Version 7.0
@@ -41,7 +55,11 @@
 param(
     [switch]$InstallTask,
     [switch]$RemoveTask,
-    [switch]$ArchiveOnly
+    [switch]$ArchiveOnly,
+    [switch]$Scheduled,
+    [switch]$DecisionOnly,
+    [string]$SimulatePower = '',
+    [string]$SimulateLastSuccess = ''
 )
 
 # -----------------------------------------------------------------------------
@@ -67,6 +85,10 @@ $GIT_USR_BIN   = 'C:\Program Files\Git\usr\bin'
 $TAR           = Join-Path $GIT_USR_BIN 'tar.exe'
 $GZIP          = Join-Path $GIT_USR_BIN 'gzip.exe'
 $KEEP_COUNT    = 5
+# Scheduled runs: a backup is due from Sunday 23:00 each week; on battery it
+# starts only at or above this charge (AC always allowed).
+$MIN_BATTERY_PCT = 50
+$LAST_SUCCESS  = Join-Path $PSScriptRoot '.last_success'
 $env:WIN_BACKUP_LOGFILE = Join-Path $PSScriptRoot 'win_backup.log'
 $LOGFILE       = $env:WIN_BACKUP_LOGFILE
 
@@ -101,24 +123,40 @@ if ($InstallTask) {
     }
 
     $action  = New-ScheduledTaskAction -Execute $pwshExe `
-                   -Argument "-NonInteractive -WindowStyle Hidden -File `"$PSCommandPath`""
+                   -Argument "-NonInteractive -WindowStyle Hidden -File `"$PSCommandPath`" -Scheduled"
 
-    # Trigger: Sunday 23:00, with a WakeToRun-friendly random delay window disabled.
-    $trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Sunday -At '23:00'
+    # TRIGGERS -- frequent chances to run; the script decides whether a backup
+    # is due (weekly, from Sunday 23:00) and whether power allows it.
+    #   hourly : any hour the machine is awake
+    #   logon, unlock : the moment the user is back after sleep or a reboot
+    $hourly = New-ScheduledTaskTrigger -Once -At (Get-Date).Date `
+                  -RepetitionInterval (New-TimeSpan -Hours 1) `
+                  -RepetitionDuration (New-TimeSpan -Days 3650)
+    $logon  = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
+    $unlockClass = Get-CimClass -Namespace 'Root/Microsoft/Windows/TaskScheduler' -ClassName 'MSFT_TaskSessionStateChangeTrigger'
+    $unlock = New-CimInstance -CimClass $unlockClass -ClientOnly
+    $unlock.StateChange = 8          # TASK_SESSION_UNLOCK
+    $unlock.UserId      = "$env:USERDOMAIN\$env:USERNAME"
+    $unlock.Enabled     = $true
+    $trigger = @($hourly, $logon, $unlock)
 
     # POWER SETTINGS (PZ13 is a Modern Standby / S0 laptop)
-    #   -WakeToRun                  : wake the machine at 23:00 to run the task
-    #   -StartWhenAvailable         : catch-up run if the 23:00 slot was missed
-    #   -DontStopIfGoingOnBatteries : a run started on AC finishes if unplugged
-    #   DisallowStartIfOnBatteries  : left True -- no fresh run on battery
-    # Known open issue: runs are still suspended/terminated under Modern
-    # Standby (see BACKUP-LOGIC.md "Known issues" and the parent CLAUDE.md TODO).
+    #   AllowStartIfOnBatteries     : the script applies the battery threshold
+    #   DontStopIfGoingOnBatteries  : a run that has started finishes
+    #   StartWhenAvailable          : a trigger missed while asleep runs on wake
+    #   no WakeToRun                : a Modern Standby wake does not let a
+    #                                 desktop app run; it only started runs
+    #                                 that were then paused (2026-09-20, -28)
+    #   ExecutionTimeLimit 12 h     : a run takes minutes; a run paused by
+    #                                 standby resumes on wake and must not be
+    #                                 killed after 2 h (orphaned tar, 2026-08)
     $settings = New-ScheduledTaskSettingsSet `
-                    -ExecutionTimeLimit (New-TimeSpan -Hours 2) `
+                    -ExecutionTimeLimit (New-TimeSpan -Hours 12) `
                     -StartWhenAvailable `
                     -RunOnlyIfNetworkAvailable `
+                    -AllowStartIfOnBatteries `
                     -DontStopIfGoingOnBatteries `
-                    -WakeToRun
+                    -MultipleInstances IgnoreNew
     $principal = New-ScheduledTaskPrincipal `
                     -UserId "$env:USERDOMAIN\$env:USERNAME" `
                     -LogonType Interactive `
@@ -131,7 +169,7 @@ if ($InstallTask) {
             -Trigger   $trigger `
             -Settings  $settings `
             -Principal $principal `
-            -Description 'Weekly backup of user data to Proton Drive. Runs only when user is logged on (required for Credential Manager access).' `
+            -Description 'Weekly backup of user data to Proton Drive. Checks hourly, at logon and at unlock; backs up only when due (from Sunday 23:00) and on AC or battery >= 50%. Runs only when the user is logged on (Credential Manager access).' `
             -Force `
             -ErrorAction Stop | Out-Null
     } catch {
@@ -148,7 +186,8 @@ if ($InstallTask) {
 
     Write-Host ""
     Write-Host "Scheduled task installed: '$TASK_NAME'"
-    Write-Host "  Schedule : Every Sunday at 23:00"
+    Write-Host "  Checks   : hourly, at logon, at unlock (backs up when due: weekly from Sunday 23:00)"
+    Write-Host "  Power    : AC, or battery >= $MIN_BATTERY_PCT%"
     Write-Host "  Logon    : Interactive (logged-on user only) -- required for Proton auth"
     Write-Host "  Script   : $PSCommandPath"
     Write-Host ""
@@ -165,6 +204,96 @@ function Warn { param([string]$m) "  [WARN] $m" | Tee-Object -FilePath $LOGFILE 
 function Fail { param([string]$m) "  [ERR]  $m" | Tee-Object -FilePath $LOGFILE -Append | Out-Host; exit 1 }
 
 # -----------------------------------------------------------------------------
+# POWER STATE, POWER REQUEST (kernel32)
+# -----------------------------------------------------------------------------
+# PowerCreateRequest/PowerSetRequest: while a SystemRequired request is held
+# the machine does not idle into sleep -- on AC with no time limit, on battery
+# for at most 5 minutes after the sleep timeout (Microsoft Learn,
+# PowerSetRequest remarks). Requests end on lid close, power button or
+# Start > Sleep. ExecutionRequired additionally asks Windows not to suspend
+# the process. Both end when this process exits.
+if (-not ('PwbPower.Native' -as [type])) {
+    Add-Type -Namespace PwbPower -Name Native -MemberDefinition @'
+[StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+public struct REASON_CONTEXT { public uint Version; public uint Flags; [MarshalAs(UnmanagedType.LPWStr)] public string SimpleReasonString; }
+[StructLayout(LayoutKind.Sequential)]
+public struct SYSTEM_POWER_STATUS { public byte ACLineStatus; public byte BatteryFlag; public byte BatteryLifePercent; public byte SystemStatusFlag; public int BatteryLifeTime; public int BatteryFullLifeTime; }
+[DllImport("kernel32.dll", SetLastError = true)] public static extern IntPtr PowerCreateRequest(ref REASON_CONTEXT context);
+[DllImport("kernel32.dll", SetLastError = true)] public static extern bool PowerSetRequest(IntPtr handle, int requestType);
+[DllImport("kernel32.dll", SetLastError = true)] public static extern bool GetSystemPowerStatus(out SYSTEM_POWER_STATUS status);
+'@
+}
+
+function Get-PowerState {
+    # Returns @{ OnAC = bool; Percent = int (-1 unknown); Text = string }
+    if ($DecisionOnly -and $SimulatePower) {
+        if ($SimulatePower -eq 'AC') { return @{ OnAC = $true; Percent = -1; Text = 'AC (simulated)' } }
+        $p = [int]$SimulatePower
+        return @{ OnAC = $false; Percent = $p; Text = "battery $p% (simulated)" }
+    }
+    $s = New-Object PwbPower.Native+SYSTEM_POWER_STATUS
+    if (-not [PwbPower.Native]::GetSystemPowerStatus([ref]$s)) { return @{ OnAC = $true; Percent = -1; Text = 'unknown (treated as AC)' } }
+    $pct = if ($s.BatteryLifePercent -eq 255) { -1 } else { [int]$s.BatteryLifePercent }
+    if ($s.ACLineStatus -eq 0) { return @{ OnAC = $false; Percent = $pct; Text = "battery $pct%" } }
+    return @{ OnAC = $true; Percent = $pct; Text = $(if ($pct -ge 0) { "AC, battery $pct%" } else { 'AC' }) }
+}
+
+function Get-DueSince {
+    # Most recent Sunday 23:00 (local) that is not in the future.
+    $now = Get-Date
+    $d = $now.Date.AddDays(-[int]$now.DayOfWeek).AddHours(23)
+    if ($d -gt $now) { $d = $d.AddDays(-7) }
+    return $d
+}
+
+function Get-LastSuccess {
+    $raw = if ($DecisionOnly -and $SimulateLastSuccess) { $SimulateLastSuccess }
+           elseif (Test-Path $LAST_SUCCESS) { (Get-Content $LAST_SUCCESS -Raw).Trim() }
+           else { '' }
+    if (-not $raw) { return $null }
+    try {
+        return [datetime]::Parse($raw, [Globalization.CultureInfo]::InvariantCulture,
+                                 [Globalization.DateTimeStyles]::AdjustToUniversal -bor [Globalization.DateTimeStyles]::AssumeUniversal).ToLocalTime()
+    } catch { return $null }
+}
+
+# -----------------------------------------------------------------------------
+# SCHEDULED RUN: IS A BACKUP DUE, AND DOES POWER ALLOW IT?
+# -----------------------------------------------------------------------------
+if ($Scheduled -or $DecisionOnly) {
+    $dueSince = Get-DueSince
+    $lastOk   = Get-LastSuccess
+    $power    = Get-PowerState
+    $lastText = if ($lastOk) { $lastOk.ToString('yyyy-MM-dd HH:mm') } else { 'never' }
+    $state    = "last success $lastText, due since $($dueSince.ToString('yyyy-MM-dd HH:mm')), power $($power.Text)"
+
+    $decision = if ($lastOk -and $lastOk -ge $dueSince) { "SKIP not due: $state" }
+                elseif (-not $power.OnAC -and $power.Percent -ge 0 -and $power.Percent -lt $MIN_BATTERY_PCT) {
+                    "SKIP battery below $MIN_BATTERY_PCT%: $state" }
+                else { "RUN: $state" }
+
+    if ($DecisionOnly) { Write-Host "Decision: $decision"; exit 0 }
+    if ($decision -like 'SKIP not due*') { exit 0 }     # the normal hourly case: no log line
+    if ($decision -like 'SKIP*') {
+        Log "Scheduled check: $decision"
+        exit 0
+    }
+}
+
+# -----------------------------------------------------------------------------
+# ONE RUN AT A TIME
+# -----------------------------------------------------------------------------
+# A manual run and the task must not build the same archive at once. The mutex
+# is released when this process exits, including when it is killed.
+$runMutex = [System.Threading.Mutex]::new($false, 'Local\ProtonDrive-PZ13-Backup')
+$haveMutex = $false
+try { $haveMutex = $runMutex.WaitOne(0) } catch [System.Threading.AbandonedMutexException] { $haveMutex = $true }
+if (-not $haveMutex) {
+    if (-not $Scheduled) { Write-Host 'Another backup run is in progress -- exiting.' }
+    exit 0
+}
+
+# -----------------------------------------------------------------------------
 # LOG ROTATION -- keep 500 lines max
 # -----------------------------------------------------------------------------
 if (Test-Path $LOGFILE) {
@@ -177,6 +306,22 @@ if (Test-Path $LOGFILE) {
 Log "========================================================"
 Log "Win11 PZ13 Backup - $BACKUP_DATE"
 Log "========================================================"
+if ($Scheduled) { Log "Scheduled run: $decision" } else { Log "Manual run, power $((Get-PowerState).Text)" }
+
+# Keep the machine awake until this process exits (see POWER REQUEST above).
+$reason = New-Object PwbPower.Native+REASON_CONTEXT
+$reason.Version = 0                  # POWER_REQUEST_CONTEXT_VERSION
+$reason.Flags   = 1                  # POWER_REQUEST_CONTEXT_SIMPLE_STRING
+$reason.SimpleReasonString = 'Proton Drive backup (win_backup.ps1)'
+$powerRequest = [PwbPower.Native]::PowerCreateRequest([ref]$reason)
+if ($powerRequest -eq [IntPtr]::Zero -or $powerRequest -eq [IntPtr]::new(-1)) {
+    Warn "Could not create a power request -- the machine may sleep during the run"
+} else {
+    $sys  = [PwbPower.Native]::PowerSetRequest($powerRequest, 1)   # PowerRequestSystemRequired
+    $exec = [PwbPower.Native]::PowerSetRequest($powerRequest, 3)   # PowerRequestExecutionRequired
+    if ($sys) { Ok "Keep-awake power request set (system required: $sys, execution required: $exec)" }
+    else      { Warn "Power request not accepted -- the machine may sleep during the run" }
+}
 
 # -----------------------------------------------------------------------------
 # PRE-FLIGHT
@@ -306,6 +451,16 @@ Ok "Audit complete - $includeCount include paths"
 # -----------------------------------------------------------------------------
 Log "--- Step 2: Create archive ---"
 Log "Output: $BACKUP_TMP"
+
+# A tar left running by an earlier run that was killed (this run holds the
+# single-run mutex, so any such tar is orphaned) would hold the archive open.
+$staleTar = @(Get-CimInstance Win32_Process -Filter "Name = 'tar.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.ExecutablePath -eq $TAR -and $_.CommandLine -like '*win11-pz13-*' })
+foreach ($p in $staleTar) {
+    Warn "Stopping tar left by an earlier run (PID $($p.ProcessId), started $($p.CreationDate))"
+    Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+}
+if ($staleTar) { Start-Sleep -Seconds 2 }
 
 if (Test-Path $BACKUP_TMP) { Remove-Item $BACKUP_TMP -Force }
 

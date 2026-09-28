@@ -122,8 +122,11 @@ Takes about 3–5 minutes on PZ13 (2026-09-28: 2 min 19 s, 439 MB). Expect
 
 ### 1.9 Install the scheduled task (Admin PS7)
 
-Expect `Scheduled task installed: 'Proton Drive - Win11 PZ13 Backup'` and
+Expect `Scheduled task installed: 'Proton Drive - Win11 PZ13 Backup'`,
+`Checks : hourly, at logon, at unlock (backs up when due: weekly from Sunday 23:00)`,
+`Power : AC, or battery >= 50%` and
 `Script : C:\Users\andre\DevSpace\z-repo\proton-drive\proton-windows-backup\win_backup.ps1`.
+Re-run this after any change to the task settings in `win_backup.ps1`.
 
 ```powershell
 & "C:\Users\andre\DevSpace\z-repo\proton-drive\proton-windows-backup\win_backup.ps1" -InstallTask
@@ -131,8 +134,8 @@ Expect `Scheduled task installed: 'Proton Drive - Win11 PZ13 Backup'` and
 
 ### 1.10 Power settings on AC (Admin PS7)
 
-Set on PZ13 on 2026-07-22 and still in place. These do not stop the Modern Standby failures
-described in `BACKUP-LOGIC.md` ("Known Issue"). Expect no output from each command.
+Set on PZ13 on 2026-07-22 and still in place. How these combine with the keep-awake request:
+`BACKUP-LOGIC.md` "Schedule and Power". Expect no output from each command.
 
 ```powershell
 powercfg /change standby-timeout-ac 0
@@ -150,19 +153,23 @@ powercfg /setacvalueindex SCHEME_CURRENT SUB_SLEEP RTCWAKE 1
 powercfg /setactive SCHEME_CURRENT
 ```
 
-### 1.11 Test the scheduled path (PS7)
+### 1.11 Test the scheduled path (Admin PS7)
 
-Expect no output.
+Starting the task by hand does nothing if a backup has already run since Sunday 23:00; that
+is by design. The two suites below test both cases.
+
+Task settings, decisions, keep-awake request, a not-due run. About 2 minutes. Expect
+`PASS 9  FAIL 0  INFO 1`.
 
 ```powershell
-Start-ScheduledTask -TaskName 'Proton Drive - Win11 PZ13 Backup'
+pwsh -NoProfile -File "C:\Users\andre\DevSpace\z-repo\proton-drive\proton-windows-backup\tests\Run-Tests.ps1" -Suite schedule-power
 ```
 
-After about 5 minutes, expect `LastTaskResult` `0`. `267009` means still running; wait and
-repeat.
+A real backup through the task (makes one due first; uploads). About 3–5 minutes. Expect
+`PASS 1  FAIL 0`.
 
 ```powershell
-Get-ScheduledTaskInfo -TaskName 'Proton Drive - Win11 PZ13 Backup' | Select-Object LastRunTime, LastTaskResult
+pwsh -NoProfile -File "C:\Users\andre\DevSpace\z-repo\proton-drive\proton-windows-backup\tests\Run-Tests.ps1" -Suite scheduled-run -AllowUpload
 ```
 
 ### 1.12 Check the log (PS7)
@@ -178,17 +185,19 @@ Get-Content "C:\Users\andre\DevSpace\z-repo\proton-drive\proton-windows-backup\w
 ## Phase 2 — Weekly Check (Monday, PS7)
 
 No external monitor is configured; these checks are the only way a missed run is noticed.
+The task starts every hour, so its `LastRunTime` says little; the decision line does.
 
-Expect `LastRunTime` on or after Sunday 23:00 and `LastTaskResult` `0`.
+Expect `Decision: SKIP not due: last success <time after Sunday 23:00> ...`. `RUN` means no
+backup has run since Sunday 23:00 yet; `SKIP battery` means it is waiting for AC or 50%.
 
 ```powershell
-Get-ScheduledTaskInfo -TaskName 'Proton Drive - Win11 PZ13 Backup' | Select-Object LastRunTime, LastTaskResult, NextRunTime
+& "C:\Users\andre\DevSpace\z-repo\proton-drive\proton-windows-backup\win_backup.ps1" -DecisionOnly
 ```
 
-Expect a UTC timestamp from within the last 7 days.
+Expect `LastTaskResult` `0`.
 
 ```powershell
-Get-Content "C:\Users\andre\DevSpace\z-repo\proton-drive\proton-windows-backup\.last_success"
+Get-ScheduledTaskInfo -TaskName 'Proton Drive - Win11 PZ13 Backup' | Select-Object LastRunTime, LastTaskResult
 ```
 
 Expect five archives, the newest from this week.
@@ -197,8 +206,9 @@ Expect five archives, the newest from this week.
 & "C:\Users\andre\DevSpace\z-repo\proton-drive\proton-windows-backup\win_restore.ps1" list
 ```
 
-If the run failed, look up `LastTaskResult` under Troubleshooting, then run 1.8 manually so
-the week is not lost.
+If the decision is still `RUN` on AC, a run failed: check the log (1.12) and look up
+`LastTaskResult` under Troubleshooting. Any failed run is retried at the next hour, logon or
+unlock; 1.8 runs one now.
 
 ---
 
@@ -393,9 +403,21 @@ Remove-Item "$env:TEMP\restore-staging" -Recurse -Force
 | 2147942402 | 0x80070002 | File not found. 2026-07-12: the task called `pwsh.exe` without a path. Fixed; `-InstallTask` registers the full path |
 | 1073807364 | 0x40010004 | Process terminated. 2026-07-20, during a catch-up run |
 | 267014 | 0x41306 | Task terminated. See `../history/scheduled-task-missed-runs.md` |
-| 2147943467 | 0x8007042B | Process terminated unexpectedly. 2026-09-28, the Modern Standby known issue |
+| 2147943467 | 0x8007042B | Process terminated unexpectedly. 2026-09-28, under the old schedule; see `BACKUP-LOGIC.md` "Modern Standby" |
 
 For any failure: run 1.8 manually so the week is covered, then check the log.
+
+### Log shows "Scheduled check: SKIP battery below 50%"
+
+A backup was due but PZ13 was on battery below 50%. Nothing to fix: the next hourly, logon or
+unlock check runs it once on AC or at 50% or more. The threshold is `$MIN_BATTERY_PCT` in
+`win_backup.ps1`.
+
+### A backup was due but nothing ran
+
+Run the Phase 2 decision check. PZ13 cannot back up while asleep (Modern Standby); the run
+starts at the first awake hour, logon or unlock. If it shows `RUN` on AC while PZ13 has been
+awake for over an hour, run 1.11.
 
 ### "cannot be run because it contained a #requires statement for ... 7.0"
 
