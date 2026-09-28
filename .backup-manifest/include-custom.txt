@@ -1,0 +1,20 @@
+# %USERPROFILE%\proton-windows-backup\.backup-manifest\include-custom.txt
+# Paths not auto-discovered by win_audit.ps1.
+# One absolute path per line. Lines starting with # are ignored.
+# This file is NEVER overwritten by the audit.
+#
+# Examples:
+#   C:\MyApp\data
+#   D:\Projects\ClientWork
+
+# Added 2026-08-25: local (non-Proton-Drive-synced) project dirs and Claude Code
+# config/data not caught by win_audit.ps1's fixed discovery patterns.
+C:\Users\andre\espressif
+C:\Users\andre\lite-vna
+C:\Users\andre\witrn
+C:\Users\andre\usb_driver
+C:\Users\andre\winspectrum
+C:\Users\andre\.claude.json
+C:\Users\andre\.claude.json.backup
+C:\Users\andre\Pictures
+C:\Users\andre\bin

@@ -16,24 +16,48 @@
 #
 # Run  help           for full command reference.
 # Run  help <command> for detailed help on one command.
+#
+# Archives are read and extracted with GNU tar from Git for Windows, the same
+# tar that creates them (see win_backup.ps1). Windows' own tar.exe can list
+# them but restores non-ASCII filenames with the wrong names.
+#
+# -DryRun (restore packages only): show what would be offered for reinstall,
+# without asking or installing anything.
 # =============================================================================
 
-#Requires -Version 5.1
+#Requires -Version 7.0
 
 param(
     [Parameter(Position=0)] [string]$Command  = '',
     [Parameter(Position=1)] [string]$Arg1     = '',
     [Parameter(Position=2)] [string]$Arg2     = '',
-    [Parameter(Position=3)] [string]$Arg3     = ''
+    [Parameter(Position=3)] [string]$Arg3     = '',
+    [switch]$DryRun
 )
 
 # -- Configuration ------------------------------------------------------------
 $REMOTE_BASE  = '/my-files/PZ13'
-$PROTON       = Join-Path $PSScriptRoot 'proton-drive.exe'
+# Proton Drive CLI -- winget-managed, same absolute path as win_backup.ps1
+$WINGET_ID    = 'Proton.ProtonDrive.CLI'
+$PROTON       = Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Packages\Proton.ProtonDrive.CLI_Microsoft.Winget.Source_8wekyb3d8bbwe\proton-drive.exe'
 $STAGING_DIR  = Join-Path $env:TEMP 'restore-staging'
 $DOWNLOAD_DIR = $env:TEMP
 $RESTORE_LOG  = Join-Path $PSScriptRoot 'win_restore.log'
 $HOME_DIR     = $env:USERPROFILE
+# GNU tar (Git for Windows)
+$GIT_USR_BIN  = 'C:\Program Files\Git\usr\bin'
+$TAR          = Join-Path $GIT_USR_BIN 'tar.exe'
+
+# For this process only: gzip via PATH, UTF-8 names and output.
+$env:Path   = "$GIT_USR_BIN;$env:Path"
+$env:LANG   = 'C.UTF-8'
+$env:LC_ALL = 'C.UTF-8'
+try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch { }
+
+# GNU tar with --force-local (so C:/... is a local file, not host:file).
+# Pass every local Windows path through TarPath (forward slashes).
+function Invoke-Tar { & $TAR --force-local @args }
+function TarPath { param([string]$p) $p -replace '\\', '/' }
 
 # -- Output helpers -----------------------------------------------------------
 function Write-Ok   { param([string]$m) Write-Host "  [OK]   $m" -ForegroundColor Green }
@@ -53,10 +77,13 @@ function Fail { param([string]$m) Write-Err $m; exit 1 }
 
 # -- Proton Drive helpers -----------------------------------------------------
 function Resolve-BackupName {
-    param([string]$Input)
-    if ($Input -like 'win11-pz13-*.tar.gz') { return $Input }
-    if ($Input -match '^\d{4}-\d{2}-\d{2}$') { return "win11-pz13-$Input.tar.gz" }
-    if ($Input -eq 'latest') {
+    # NOTE: never name this parameter $Input -- $input is a PowerShell automatic
+    # variable. With $Input the argument was lost, the wildcard below became
+    # "**", and every command silently used the newest archive (found 2026-09-28).
+    param([string]$Value)
+    if ($Value -like 'win11-pz13-*.tar.gz') { return $Value }
+    if ($Value -match '^\d{4}-\d{2}-\d{2}$') { return "win11-pz13-$Value.tar.gz" }
+    if ($Value -eq 'latest') {
         $json  = & $PROTON filesystem list $REMOTE_BASE --json 2>$null
         $items = $json | ConvertFrom-Json -ErrorAction SilentlyContinue
         if (-not $items) { Fail "No backups found or cannot parse listing" }
@@ -68,9 +95,10 @@ function Resolve-BackupName {
     # Partial match
     $json  = & $PROTON filesystem list $REMOTE_BASE --json 2>$null
     $items = $json | ConvertFrom-Json -ErrorAction SilentlyContinue
-    $name  = ($items | Where-Object { $_.name.value -like "*$Input*" } |
+    if (-not $Value) { Fail "No backup name given" }
+    $name  = ($items | Where-Object { $_.name.value -like "*$Value*" } |
               Sort-Object { $_.name.value } | Select-Object -Last 1).name.value
-    if (-not $name) { Fail "Cannot resolve backup name: '$Input'" }
+    if (-not $name) { Fail "Cannot resolve backup name: '$Value'" }
     return $name
 }
 
@@ -96,7 +124,7 @@ function Ensure-Local {
 # COMMAND: list
 # =============================================================================
 function Invoke-List {
-    if (-not (Test-Path $PROTON)) { Fail "proton-drive.exe not found at $PROTON" }
+    if (-not (Test-Path $PROTON)) { Fail "Proton Drive CLI not found at $PROTON -- install: winget install --id $WINGET_ID --exact --scope user" }
     Write-Hdr "Remote Backups -- $REMOTE_BASE"
 
     $json  = & $PROTON filesystem list $REMOTE_BASE --json 2>$null
@@ -125,7 +153,7 @@ function Invoke-List {
 function Invoke-Check {
     param([string]$BackupArg)
     if (-not $BackupArg) { Show-HelpCheck; exit 1 }
-    if (-not (Test-Path $PROTON)) { Fail "proton-drive.exe not found at $PROTON" }
+    if (-not (Test-Path $PROTON)) { Fail "Proton Drive CLI not found at $PROTON -- install: winget install --id $WINGET_ID --exact --scope user" }
 
     $name = Resolve-BackupName $BackupArg
     Write-Hdr "Archive Integrity Check -- $name"
@@ -133,10 +161,12 @@ function Invoke-Check {
     Log "check: $name"
     Write-Info "Reading every block (may take a minute)..."
 
-    $output   = tar -tzf $f 2>&1
-    $fileCount = ($output | Where-Object { $_ -notmatch '^tar:' } | Measure-Object -Line).Lines
+    $output    = Invoke-Tar -tzf (TarPath $f) 2>&1
+    $rc        = $LASTEXITCODE
+    $fileCount = @($output | Where-Object { "$_" -notmatch '^tar: ' }).Count
+    $output | Where-Object { "$_" -match '^tar: ' } | ForEach-Object { Write-Host "  $_"; Log "  tar: $_" }
 
-    if ($LASTEXITCODE -eq 0) {
+    if ($rc -eq 0) {
         Write-Ok "Archive is intact -- $fileCount entries"
         Log "check OK: $name ($fileCount entries)"
     } else {
@@ -153,7 +183,7 @@ function Invoke-Check {
 function Invoke-Diff {
     param([string]$B1, [string]$B2)
     if (-not $B1 -or -not $B2) { Show-HelpDiff; exit 1 }
-    if (-not (Test-Path $PROTON)) { Fail "proton-drive.exe not found at $PROTON" }
+    if (-not (Test-Path $PROTON)) { Fail "Proton Drive CLI not found at $PROTON -- install: winget install --id $WINGET_ID --exact --scope user" }
 
     $n1 = Resolve-BackupName $B1
     $n2 = Resolve-BackupName $B2
@@ -166,8 +196,8 @@ function Invoke-Diff {
     $f2 = Ensure-Local $n2
 
     Write-Info "Building file lists..."
-    $list1 = (tar -tzf $f1 2>$null) | Where-Object { $_ -notmatch '^tar:' } | Sort-Object
-    $list2 = (tar -tzf $f2 2>$null) | Where-Object { $_ -notmatch '^tar:' } | Sort-Object
+    $list1 = @((Invoke-Tar -tzf (TarPath $f1) 2>$null) | Where-Object { "$_" -notmatch '^tar: ' } | Sort-Object)
+    $list2 = @((Invoke-Tar -tzf (TarPath $f2) 2>$null) | Where-Object { "$_" -notmatch '^tar: ' } | Sort-Object)
 
     $set1    = [System.Collections.Generic.HashSet[string]]$list1
     $set2    = [System.Collections.Generic.HashSet[string]]$list2
@@ -208,7 +238,7 @@ function Invoke-Diff {
 function Invoke-Live {
     param([string]$BackupArg)
     if (-not $BackupArg) { Show-HelpLive; exit 1 }
-    if (-not (Test-Path $PROTON)) { Fail "proton-drive.exe not found at $PROTON" }
+    if (-not (Test-Path $PROTON)) { Fail "Proton Drive CLI not found at $PROTON -- install: winget install --id $WINGET_ID --exact --scope user" }
 
     $name = Resolve-BackupName $BackupArg
     Write-Hdr "Archive vs Live System -- $name"
@@ -219,10 +249,10 @@ function Invoke-Live {
     $f = Ensure-Local $name
     Log "live compare: $name"
 
-    # BSD tar --diff compares archive against filesystem.
-    # -C $HOME_DIR because archive paths are relative to home.
-    $output = tar --diff -zf $f -C $HOME_DIR 2>&1
-    $filtered = $output | Where-Object { $_ -notmatch '^tar: (Error exit|socket)' }
+    # tar --diff compares the archive with the files on disk.
+    # -C <profile> because archive paths are relative to the profile.
+    $output = Invoke-Tar --diff -zf (TarPath $f) -C (TarPath $HOME_DIR) 2>&1
+    $filtered = @($output | Where-Object { "$_" -notmatch '^tar: Exiting with failure status' } | ForEach-Object { "$_" })
 
     if (-not $filtered) {
         Write-Ok "Live system matches the backup -- no differences found."
@@ -244,16 +274,19 @@ function Invoke-Live {
 function Invoke-Browse {
     param([string]$BackupArg, [string]$Filter = '')
     if (-not $BackupArg) { Show-HelpBrowse; exit 1 }
-    if (-not (Test-Path $PROTON)) { Fail "proton-drive.exe not found at $PROTON" }
+    if (-not (Test-Path $PROTON)) { Fail "Proton Drive CLI not found at $PROTON -- install: winget install --id $WINGET_ID --exact --scope user" }
 
     $name = Resolve-BackupName $BackupArg
     $hdr  = if ($Filter) { "Archive Contents -- $name  [filter: $Filter]" } else { "Archive Contents -- $name" }
     Write-Hdr $hdr
 
     $f = Ensure-Local $name
-    $entries = tar -tzf $f 2>$null | Where-Object { $_ -notmatch '^tar:' }
-    if ($Filter) { $entries = $entries | Where-Object { $_ -like "*$Filter*" } }
-    $entries = $entries | Sort-Object
+    $entries = Invoke-Tar -tzf (TarPath $f) 2>$null | Where-Object { "$_" -notmatch '^tar: ' }
+    if ($Filter) {
+        $match = $Filter -replace '\\', '/'
+        $entries = $entries | Where-Object { $_ -like "*$match*" }
+    }
+    $entries = @($entries | Sort-Object)
 
     $entries | ForEach-Object { Write-Host "  $_" }
     Write-Host ""
@@ -271,7 +304,7 @@ function Invoke-Browse {
 function Invoke-Get {
     param([string]$BackupArg)
     if (-not $BackupArg) { Show-HelpGet; exit 1 }
-    if (-not (Test-Path $PROTON)) { Fail "proton-drive.exe not found at $PROTON" }
+    if (-not (Test-Path $PROTON)) { Fail "Proton Drive CLI not found at $PROTON -- install: winget install --id $WINGET_ID --exact --scope user" }
 
     $name = Resolve-BackupName $BackupArg
     Write-Hdr "Download Archive -- $name"
@@ -301,7 +334,7 @@ function Invoke-Get {
 function Invoke-RestoreFull {
     param([string]$BackupArg)
     if (-not $BackupArg) { Show-HelpRestore; exit 1 }
-    if (-not (Test-Path $PROTON)) { Fail "proton-drive.exe not found at $PROTON" }
+    if (-not (Test-Path $PROTON)) { Fail "Proton Drive CLI not found at $PROTON -- install: winget install --id $WINGET_ID --exact --scope user" }
 
     $name = Resolve-BackupName $BackupArg
     Write-Hdr "Full Restore -- $name"
@@ -320,9 +353,10 @@ function Invoke-RestoreFull {
     Write-Info "Extracting archive to $HOME_DIR ..."
     Write-Host ""
 
-    # Archive paths are relative to home dir (created with -C $HOME_DIR)
-    tar -xzf $f -C $HOME_DIR 2>&1 | Where-Object { $_ -notmatch '^tar: (socket|Error)' } |
+    # Archive paths are relative to the profile (created with -C <profile>)
+    Invoke-Tar -xzf (TarPath $f) -C (TarPath $HOME_DIR) 2>&1 |
         ForEach-Object { Write-Host "  $_"; Log "  tar: $_" }
+    if ($LASTEXITCODE -ne 0) { Fail "tar exit $LASTEXITCODE -- extraction incomplete, see the lines above" }
 
     Write-Host ""
     Write-Ok "Archive extracted."
@@ -331,17 +365,12 @@ function Invoke-RestoreFull {
     Write-Host ""
     Write-Host "  Post-restore steps:" -ForegroundColor Yellow
     Write-Host ""
-    Write-Host "  1. Reinstall applications:"
-    Write-Host "       winget import -i ~\proton-backup\.backup-manifest\winget-export.json --accept-source-agreements"
+    Write-Host "  1. Reinstall applications + Python packages from this backup:"
+    Write-Host "       .\win_restore.ps1 restore packages $name"
     Write-Host ""
-    Write-Host "  2. Reinstall Python packages (if applicable):"
-    Write-Host "       pip install -r ~\proton-backup\.backup-manifest\pip-packages.txt"
-    Write-Host ""
-    Write-Host "  3. Re-authenticate Proton Drive:"
-    Write-Host "       ~\proton-backup\proton-drive.exe auth login"
-    Write-Host ""
-    Write-Host "  4. Reinstall the backup scheduled task:"
-    Write-Host "       ~\proton-backup\win_backup.ps1 -InstallTask"
+    Write-Host "  2. Reinstall the backup scheduled task (Administrator PS7):"
+    Write-Host "       cd `"$PSScriptRoot`""
+    Write-Host "       .\win_backup.ps1 -InstallTask"
     Write-Host ""
 }
 
@@ -351,7 +380,7 @@ function Invoke-RestoreFull {
 function Invoke-RestorePath {
     param([string]$BackupArg, [string]$TargetPath)
     if (-not $BackupArg -or -not $TargetPath) { Show-HelpRestore; exit 1 }
-    if (-not (Test-Path $PROTON)) { Fail "proton-drive.exe not found at $PROTON" }
+    if (-not (Test-Path $PROTON)) { Fail "Proton Drive CLI not found at $PROTON -- install: winget install --id $WINGET_ID --exact --scope user" }
 
     $name = Resolve-BackupName $BackupArg
     Write-Hdr "Selective Restore -- $name  ->  $TargetPath"
@@ -361,8 +390,9 @@ function Invoke-RestorePath {
     # Check path exists in archive.
     # Use $archivePaths (not $matches) -- $matches is a PS7 automatic variable
     # that gets silently overwritten by any subsequent -match/-notmatch operation.
-    $archivePaths = tar -tzf $f 2>$null | Where-Object { $_ -like "*$TargetPath*" }
-    if (-not $archivePaths) {
+    $match = $TargetPath -replace '\\', '/'
+    $archivePaths = @(Invoke-Tar -tzf (TarPath $f) 2>$null | Where-Object { "$_" -notmatch '^tar: ' -and $_ -like "*$match*" })
+    if ($archivePaths.Count -eq 0) {
         Write-Host ""
         Write-Err "Path not found in archive: $TargetPath"
         Write-Host ""
@@ -384,12 +414,12 @@ function Invoke-RestorePath {
     Log "restore path: '$TargetPath' from $name ($pathCount files)"
     Write-Info "Extracting $pathCount file(s)..."
 
-    # Pass paths directly as positional arguments.
-    # BSD tar on Windows has a quirk where -T combined with -C causes
-    # "Couldn't visit directory" errors for an empty path between archive entries.
-    tar -xzf $f -C $HOME_DIR @($archivePaths) 2>&1 |
-        Where-Object { $_ -notmatch '^tar: (socket|Error)' } |
+    # --no-recursion: the list already holds every matching entry (folders and
+    # the files in them). Without it tar extracts a folder with its contents and
+    # then reports the separately named files as "Not found in archive" (exit 2).
+    Invoke-Tar -xzf (TarPath $f) -C (TarPath $HOME_DIR) --no-recursion @archivePaths 2>&1 |
         ForEach-Object { Write-Host "  $_"; Log "  tar: $_" }
+    if ($LASTEXITCODE -ne 0) { Fail "tar exit $LASTEXITCODE -- extraction incomplete, see the lines above" }
 
     Write-Host ""
     Write-Ok "$pathCount file(s) restored to $HOME_DIR\$TargetPath"
@@ -403,7 +433,7 @@ function Invoke-RestorePath {
 function Invoke-RestoreStaging {
     param([string]$BackupArg, [string]$Filter = '')
     if (-not $BackupArg) { Show-HelpRestore; exit 1 }
-    if (-not (Test-Path $PROTON)) { Fail "proton-drive.exe not found at $PROTON" }
+    if (-not (Test-Path $PROTON)) { Fail "Proton Drive CLI not found at $PROTON -- install: winget install --id $WINGET_ID --exact --scope user" }
 
     $name = Resolve-BackupName $BackupArg
     $hdr  = if ($Filter) { "Staging Extract -- $name  [filter: $Filter]  ->  $STAGING_DIR" } else { "Staging Extract -- $name  ->  $STAGING_DIR" }
@@ -420,24 +450,24 @@ function Invoke-RestoreStaging {
     Log "restore staging: $name filter='$Filter' -> $STAGING_DIR"
 
     if ($Filter) {
-        $archivePaths = tar -tzf $f 2>$null | Where-Object { $_ -like "*$Filter*" -and $_ -notmatch '^tar:' }
-        if (-not $archivePaths) {
+        $match = $Filter -replace '\\', '/'
+        $archivePaths = @(Invoke-Tar -tzf (TarPath $f) 2>$null | Where-Object { "$_" -notmatch '^tar: ' -and $_ -like "*$match*" })
+        if ($archivePaths.Count -eq 0) {
             Write-Err "Path not found in archive: $Filter"
             Write-Host "  Use 'browse' to check paths: .\win_restore.ps1 browse $BackupArg"
             exit 1
         }
-        $pathCount = @($archivePaths).Count
+        $pathCount = $archivePaths.Count
         Write-Info "Extracting $pathCount file(s) matching '$Filter'..."
-        # Pass paths directly as positional arguments (avoids -T + -C quirk in BSD tar on Windows)
-        tar -xzf $f -C $STAGING_DIR @($archivePaths) 2>&1 |
-            Where-Object { $_ -notmatch '^tar: (socket|Error)' } |
-            ForEach-Object { Log "  tar: $_" }
+        # --no-recursion: see Invoke-RestorePath
+        Invoke-Tar -xzf (TarPath $f) -C (TarPath $STAGING_DIR) --no-recursion @archivePaths 2>&1 |
+            ForEach-Object { Write-Host "  $_"; Log "  tar: $_" }
     } else {
         Write-Info "Extracting full archive..."
-        tar -xzf $f -C $STAGING_DIR 2>&1 |
-            Where-Object { $_ -notmatch '^tar: (socket|Error)' } |
-            ForEach-Object { Log "  tar: $_" }
+        Invoke-Tar -xzf (TarPath $f) -C (TarPath $STAGING_DIR) 2>&1 |
+            ForEach-Object { Write-Host "  $_"; Log "  tar: $_" }
     }
+    if ($LASTEXITCODE -ne 0) { Fail "tar exit $LASTEXITCODE -- extraction incomplete, see the lines above" }
 
     Write-Host ""
     Write-Ok "Extracted to: $STAGING_DIR"
@@ -460,41 +490,72 @@ function Invoke-RestoreStaging {
 function Invoke-RestorePackages {
     param([string]$BackupArg)
     if (-not $BackupArg) { Show-HelpRestore; exit 1 }
-    if (-not (Test-Path $PROTON)) { Fail "proton-drive.exe not found at $PROTON" }
+    if (-not (Test-Path $PROTON)) { Fail "Proton Drive CLI not found at $PROTON -- install: winget install --id $WINGET_ID --exact --scope user" }
 
     $name = Resolve-BackupName $BackupArg
     Write-Hdr "Package Reinstall -- $name"
 
     $f = Ensure-Local $name
 
-    # Extract winget-export.json to staging
+    # Extract the package manifests to staging.
+    # The manifest's path INSIDE the archive depends on the backup directory name,
+    # which has changed across versions (proton-backup/ -> proton-windows-backup/ ->
+    # DevSpace/z-repo/proton-drive/proton-windows-backup/). Discover the real entry from the
+    # archive rather than hardcoding a directory name -- this has silently broken
+    # `restore packages` twice already after a rename. Match on the stable tail
+    # (`.backup-manifest/<file>`) wherever it sits in the tree.
     $tmpDir = Join-Path $env:TEMP "restore-pkgs-$(Get-Date -Format 'yyyyMMddHHmmss')"
     New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
     try {
-        tar -xzf $f -C $tmpDir 'proton-backup/.backup-manifest/winget-export.json' 2>$null
-        $wingetFile = Join-Path $tmpDir 'proton-backup\.backup-manifest\winget-export.json'
-        if (Test-Path $wingetFile) {
-            Write-Info "winget export found -- contents:"
-            Get-Content $wingetFile | Select-Object -First 20 | ForEach-Object { Write-Host "    $_" }
-            Write-Host ""
-            $confirm = Read-Host "  Reinstall all packages? [y/N]"
-            if ($confirm -match '^[Yy]$') {
-                winget import -i $wingetFile --accept-source-agreements --accept-package-agreements
+        $allEntries = Invoke-Tar -tzf (TarPath $f) 2>$null | Where-Object { "$_" -notmatch '^tar: ' }
+
+        # -- winget-export.json --
+        $wingetEntry = $allEntries |
+            Where-Object { $_ -like '*.backup-manifest/winget-export.json' } |
+            Select-Object -First 1
+        if ($wingetEntry) {
+            Invoke-Tar -xzf (TarPath $f) -C (TarPath $tmpDir) $wingetEntry 2>$null
+            $wingetFile = Join-Path $tmpDir ($wingetEntry -replace '/', '\')
+            if (Test-Path $wingetFile) {
+                Write-Info "winget export found ($wingetEntry) -- contents:"
+                Get-Content $wingetFile | Select-Object -First 20 | ForEach-Object { Write-Host "    $_" }
+                Write-Host ""
+                if ($DryRun) {
+                    Write-Info "DryRun: would ask, then run: winget import -i <that file> --accept-source-agreements --accept-package-agreements"
+                } else {
+                    $confirm = Read-Host "  Reinstall all packages? [y/N]"
+                    if ($confirm -match '^[Yy]$') {
+                        winget import -i $wingetFile --accept-source-agreements --accept-package-agreements
+                    }
+                }
+            } else {
+                Write-Warn "winget-export.json entry found in listing but did not extract"
             }
         } else {
             Write-Warn "winget-export.json not found in archive"
         }
 
-        # Also handle pip-packages.txt
-        tar -xzf $f -C $tmpDir 'proton-backup/.backup-manifest/pip-packages.txt' 2>$null
-        $pipFile = Join-Path $tmpDir 'proton-backup\.backup-manifest\pip-packages.txt'
-        if (Test-Path $pipFile) {
-            $pkgCount = (Get-Content $pipFile | Measure-Object -Line).Lines
-            Write-Host ""
-            Write-Info "pip-packages.txt found ($pkgCount packages)"
-            $confirm2 = Read-Host "  Reinstall pip packages? [y/N]"
-            if ($confirm2 -match '^[Yy]$') {
-                pip install -r $pipFile
+        # -- pip-packages.txt --
+        $pipEntry = $allEntries |
+            Where-Object { $_ -like '*.backup-manifest/pip-packages.txt' } |
+            Select-Object -First 1
+        if ($pipEntry) {
+            Invoke-Tar -xzf (TarPath $f) -C (TarPath $tmpDir) $pipEntry 2>$null
+            $pipFile = Join-Path $tmpDir ($pipEntry -replace '/', '\')
+            if (Test-Path $pipFile) {
+                $pkgCount = (Get-Content $pipFile | Measure-Object -Line).Lines
+                Write-Host ""
+                Write-Info "pip-packages.txt found ($pipEntry, $pkgCount packages)"
+                if ($DryRun) {
+                    Write-Info "DryRun: would ask, then run: pip install -r <that file>"
+                } else {
+                    $confirm2 = Read-Host "  Reinstall pip packages? [y/N]"
+                    if ($confirm2 -match '^[Yy]$') {
+                        pip install -r $pipFile
+                    }
+                }
+            } else {
+                Write-Warn "pip-packages.txt entry found in listing but did not extract"
             }
         }
     } finally {
@@ -551,8 +612,9 @@ COMMANDS
   restore staging  <backup>  [filter]
     Safe extract to %TEMP%\restore-staging\ -- nothing overwritten.
 
-  restore packages  <backup>
+  restore packages  <backup>  [-DryRun]
     Reinstall winget packages and pip packages from backup.
+    -DryRun shows what would be offered, without asking or installing.
 
   help  [command]
     This overview, or detailed help for a specific command.
@@ -604,7 +666,11 @@ restore sub-commands:
 # MAIN DISPATCH
 # =============================================================================
 "" | Add-Content -Path $RESTORE_LOG -Encoding utf8 2>$null
-Log "=== win_restore.ps1 $Command $Arg1 $Arg2 $Arg3 ==="
+Log "=== win_restore.ps1 $Command $Arg1 $Arg2 $Arg3$(if ($DryRun) { ' -DryRun' }) ==="
+
+if ($Command -and $Command.ToLower() -notin 'help', '-h', '--help' -and -not (Test-Path $TAR)) {
+    Fail "GNU tar not found at $TAR -- install Git for Windows: winget install --id Git.Git --exact"
+}
 
 switch ($Command.ToLower()) {
     'list'    { Invoke-List }

@@ -2,35 +2,46 @@
 # win_backup.ps1
 # Weekly full backup of Windows 11 (PZ13) user data to Proton Drive.
 #
-# SCHEDULE -- installed automatically with -InstallTask switch:
-#   Sunday at 23:00, runs only when user is logged on
-#   (critical: "run when user is logged on" allows Credential Manager access)
+# LOCATION
+#   Runs from the git repo that holds it (the scheduled task points here).
+#   win_backup.log, .last_success and .backup-manifest\ are written next to
+#   this script and are gitignored, except the two *-custom.txt files.
+#   The Proton Drive CLI is winget-managed (user scope) -- see $PROTON below.
+#   Archives are made with GNU tar from Git for Windows -- see $TAR below.
+#
+# SCHEDULE -- installed with -InstallTask (Administrator):
+#   Sunday 23:00, LogonType Interactive (required for Credential Manager access)
 #
 # WHAT IT DOES
-#   0. Checks for a newer Proton Drive CLI (winget), smoke-tests and installs
-#      it before anything else depends on the binary -- auto-rollback on any
-#      failure, never blocks the backup itself. See "STEP 0" below.
-#   1. Runs win_audit.ps1 to update the include/exclude manifest
-#   2. Creates a tar.gz archive of everything in include.txt
-#      minus everything in exclude.txt
+#   0. winget upgrade of the Proton Drive CLI (non-fatal)
+#   1. Runs win_audit.ps1 to regenerate the include/exclude manifest
+#   2. Creates a tar.gz of everything in include.txt minus exclude.txt, then
+#      re-reads the whole archive. A tar failure or an unreadable archive stops
+#      the run here: nothing is uploaded and retention does not run.
 #   3. Uploads to Proton Drive: /my-files/PZ13/
-#   4. Keeps the 5 most recent backups; deletes older ones from Proton Drive
-#   5. Logs everything to ~\proton-windows-backup\win_backup.log
+#   4. Keeps the 5 most recent archives; trashes older ones, then empties trash
+#   5. Logs to win_backup.log in this directory
+#   6. Writes .last_success (UTC) and optionally pings HEARTBEAT_URL
 #
 # RESTORE
-#   Use win_restore.ps1  (run .\win_restore.ps1 help  for full reference)
+#   .\win_restore.ps1 help
 #
-# USAGE
+# USAGE (PowerShell 7)
 #   .\win_backup.ps1                # run backup now
-#   .\win_backup.ps1 -InstallTask   # install scheduled task (requires admin once)
+#   .\win_backup.ps1 -InstallTask   # install scheduled task (Administrator)
 #   .\win_backup.ps1 -RemoveTask    # remove scheduled task
+#   .\win_backup.ps1 -ArchiveOnly   # test: audit + archive + verify only. No
+#                                   # Proton Drive access, no upload, no
+#                                   # retention, no .last_success. The archive
+#                                   # is left in %TEMP% for inspection.
 # =============================================================================
 
-#Requires -Version 5.1
+#Requires -Version 7.0
 
 param(
     [switch]$InstallTask,
-    [switch]$RemoveTask
+    [switch]$RemoveTask,
+    [switch]$ArchiveOnly
 )
 
 # -----------------------------------------------------------------------------
@@ -41,8 +52,20 @@ $BACKUP_LABEL  = "win11-pz13-$BACKUP_DATE.tar.gz"
 $BACKUP_TMP    = Join-Path $env:TEMP $BACKUP_LABEL
 $REMOTE_BASE   = '/my-files/PZ13'
 $MANIFEST_DIR  = Join-Path $PSScriptRoot '.backup-manifest'
-$PROTON        = Join-Path $PSScriptRoot 'proton-drive.exe'
+# Proton Drive CLI -- installed and upgraded by winget (user scope). The
+# absolute package path is used so the scheduled task depends on neither PATH
+# nor winget's Links shim. winget upgrades a portable package in place, so
+# this path does not change between versions.
+$WINGET_ID     = 'Proton.ProtonDrive.CLI'
+$PROTON        = Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Packages\Proton.ProtonDrive.CLI_Microsoft.Winget.Source_8wekyb3d8bbwe\proton-drive.exe'
 $AUDIT         = Join-Path $PSScriptRoot 'win_audit.ps1'
+# GNU tar (Git for Windows). Windows' own tar.exe (bsdtar 3.8.8) crashes with
+# an access violation on filenames outside the ANSI code page (e.g. Chinese),
+# leaving a truncated archive, and follows junctions. GNU tar handles Unicode
+# names and stores junctions as links. Tested 2026-09-28 (tests\suites\archiver-*).
+$GIT_USR_BIN   = 'C:\Program Files\Git\usr\bin'
+$TAR           = Join-Path $GIT_USR_BIN 'tar.exe'
+$GZIP          = Join-Path $GIT_USR_BIN 'gzip.exe'
 $KEEP_COUNT    = 5
 $env:WIN_BACKUP_LOGFILE = Join-Path $PSScriptRoot 'win_backup.log'
 $LOGFILE       = $env:WIN_BACKUP_LOGFILE
@@ -83,25 +106,13 @@ if ($InstallTask) {
     # Trigger: Sunday 23:00, with a WakeToRun-friendly random delay window disabled.
     $trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Sunday -At '23:00'
 
-    # POWER MANAGEMENT -- CRITICAL FOR LAPTOPS
-    # Root cause of missed runs on a laptop that is always on AC power but
-    # sleeps (screen off / idle): at 23:00 the CPU is asleep, so an
-    # Interactive task with WakeToRun=False cannot fire. It misses the slot,
-    # then a catch-up run starts when the machine briefly wakes -- and is
-    # terminated when it sleeps again (LastTaskResult 0x40010004 =
-    # DBG_TERMINATE_PROCESS).
-    #
+    # POWER SETTINGS (PZ13 is a Modern Standby / S0 laptop)
     #   -WakeToRun                  : wake the machine at 23:00 to run the task
-    #   -DontStopIfGoingOnBatteries : a run that STARTED on AC finishes even if
-    #                                 the charger is briefly pulled mid-backup
-    #   DisallowStartIfOnBatteries  : left True -- do NOT start a fresh run on
-    #                                 battery (Task Scheduler has no percentage
-    #                                 threshold; this is the closest to "only
-    #                                 on power"). Harmless here since the
-    #                                 machine is always on AC.
-    #
-    # NOTE: WakeToRun requires the AC power plan to allow wake timers AND to
-    # not hard-sleep the CPU. See RUNBOOK phase 5 for the powercfg commands.
+    #   -StartWhenAvailable         : catch-up run if the 23:00 slot was missed
+    #   -DontStopIfGoingOnBatteries : a run started on AC finishes if unplugged
+    #   DisallowStartIfOnBatteries  : left True -- no fresh run on battery
+    # Known open issue: runs are still suspended/terminated under Modern
+    # Standby (see BACKUP-LOGIC.md "Known issues" and the parent CLAUDE.md TODO).
     $settings = New-ScheduledTaskSettingsSet `
                     -ExecutionTimeLimit (New-TimeSpan -Hours 2) `
                     -StartWhenAvailable `
@@ -129,7 +140,7 @@ if ($InstallTask) {
         Write-Host ""
         Write-Host "  Requires Administrator. Right-click your terminal and choose"
         Write-Host "  'Run as Administrator', then run:"
-        Write-Host "    cd ~\proton-windows-backup"
+        Write-Host "    cd `"$PSScriptRoot`""
         Write-Host "    .\win_backup.ps1 -InstallTask"
         Write-Host ""
         exit 1
@@ -170,140 +181,107 @@ Log "========================================================"
 # -----------------------------------------------------------------------------
 # PRE-FLIGHT
 # -----------------------------------------------------------------------------
-if (-not (Test-Path $PROTON))  { Fail "proton-drive.exe not found at $PROTON" }
+if (-not (Test-Path $PROTON))  { Fail "Proton Drive CLI not found at $PROTON -- install: winget install --id $WINGET_ID --exact --scope user" }
 if (-not (Test-Path $AUDIT))   { Fail "win_audit.ps1 not found at $AUDIT" }
-
-# Verify tar.exe is available (built into Windows 10/11)
-if (-not (Get-Command tar -ErrorAction SilentlyContinue)) {
-    Fail "tar.exe not found. Required: Windows 10 build 17063 or later."
+if (-not (Test-Path $TAR) -or -not (Test-Path $GZIP)) {
+    Fail "GNU tar/gzip not found in $GIT_USR_BIN -- install Git for Windows: winget install --id Git.Git --exact"
 }
 
+# For this process only: GNU tar starts gzip via PATH; UTF-8 names and output.
+$env:Path   = "$GIT_USR_BIN;$env:Path"
+$env:LANG   = 'C.UTF-8'
+$env:LC_ALL = 'C.UTF-8'
+try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch { }
+
+if ($ArchiveOnly) {
+    Log "ArchiveOnly test run: no Proton Drive access, no upload, no retention"
+} else {
+# Steps 0 and the connection check need Proton Drive; -ArchiveOnly skips them.
+
 # -----------------------------------------------------------------------------
-# STEP 0 -- CHECK FOR / INSTALL A NEWER PROTON DRIVE CLI
+# STEP 0 -- UPDATE THE PROTON DRIVE CLI (winget)
 # -----------------------------------------------------------------------------
-# Cheap check first (winget show, no download), then download+verify+smoke-test
-# +promote only if actually newer -- avoids re-fetching a ~120MB binary every
-# week just to find it's already current. `winget show`/`winget download`
-# resolve the same official Proton AG package, same binary/URL Proton
-# publishes directly, hash-verified by winget itself (confirmed live
-# 2026-09-16 on this machine). Self-contained and non-fatal: any failure here
-# warns and leaves the PREVIOUS binary in place, then Step 1 onward proceeds
-# normally -- an update problem must never be the reason a weekly backup is
-# missed. Same shape (staged download, checksum, smoke-test with a real
-# authenticated call before promotion, .bak kept until the live binary is
-# re-verified, auto-rollback) as the RPi's own proven auto-install, which
-# lives in the separate xware-update repo, not this one -- see
-# z-repo/proton-drive/CLAUDE.md's "Proton Drive CLI" section.
-Log "--- Step 0: Check for Proton Drive CLI update ---"
+# The CLI is winget-managed; winget upgrades it in place. Non-fatal: if winget
+# is missing, fails, or has no newer version, the installed binary is used.
+# A broken new release is stopped by the pre-flight check below, before any
+# archive is built. There is no automatic rollback. To go back to an older
+# release (only while Proton still publishes it in the winget catalog):
+#   winget show --id Proton.ProtonDrive.CLI --versions
+#   winget install --id Proton.ProtonDrive.CLI --exact --scope user --version <old> --force
+Log "--- Step 0: Proton Drive CLI update (winget) ---"
+
+function Get-CliVersion {
+    foreach ($line in (& $PROTON --version 2>$null)) {
+        if ($line -match '(\d+\.\d+\.\d+)') { return $Matches[1] }
+    }
+    return $null
+}
 
 if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
-    Warn "winget not available -- skipping CLI update check"
+    Warn "winget not available -- skipping CLI update"
 } else {
-    $currentVer = $null
-    foreach ($line in (& $PROTON --version 2>$null)) {
-        if ($line -match '(\d+\.\d+\.\d+)') { $currentVer = $Matches[1]; break }
-    }
+    $beforeVer  = Get-CliVersion
+    $upgradeOut = winget upgrade --id $WINGET_ID --exact --scope user --silent --disable-interactivity `
+                      --accept-source-agreements --accept-package-agreements 2>&1
+    # Log winget's text lines; drop progress-bar and spinner lines.
+    $upgradeOut | Where-Object { "$_" -match '[A-Za-z]' -and "$_" -notmatch '[KMG]B\s*/\s*\d' } |
+        ForEach-Object { Log "  winget: $_" }
+    $afterVer = Get-CliVersion
 
-    $latestVer = $null
-    $showOutput = winget show --id Proton.ProtonDrive.CLI --accept-source-agreements 2>&1
-    foreach ($line in $showOutput) {
-        if ($line -match '^Version:\s*(\S+)') { $latestVer = $Matches[1]; break }
-    }
-
-    if (-not $currentVer) {
-        Warn "Could not read the currently installed CLI version -- skipping update check (pre-flight below will catch a broken binary)"
-    } elseif (-not $latestVer) {
-        Warn "Could not determine the latest Proton Drive CLI version via winget -- skipping this run"
-    } elseif ($latestVer -eq $currentVer) {
-        Ok "Proton Drive CLI is current ($currentVer)"
+    if (-not $afterVer) {
+        Warn "Could not read the CLI version after winget upgrade -- pre-flight check decides"
+    } elseif ($afterVer -eq $beforeVer) {
+        Ok "Proton Drive CLI is current ($afterVer)"
     } else {
-        Log "Proton Drive CLI update available: installed=$currentVer latest=$latestVer -- starting staged install"
+        Ok "Proton Drive CLI upgraded: $beforeVer -> $afterVer"
 
-        $stageDir = Join-Path $env:TEMP "proton-drive-update-$BACKUP_DATE"
-        # $env:TEMP, not $PSScriptRoot: win_audit.ps1 excludes AppData/Local/Temp
-        # from the backup, so a stray staged file here can never get archived --
-        # the same class of mistake that nearly doubled a backup's size once
-        # already when a .bak was left inside the backed-up directory (see
-        # history/cli-version-checking-and-upgrades.md).
-        if (Test-Path $stageDir) { Remove-Item $stageDir -Recurse -Force }
-        New-Item -ItemType Directory -Path $stageDir -Force | Out-Null
-
-        $downloadOutput = winget download --id Proton.ProtonDrive.CLI --download-directory $stageDir `
-            --accept-source-agreements --accept-package-agreements 2>&1
-        $downloadOutput | ForEach-Object { Log "  winget: $_" }
-
-        $staged = Get-ChildItem $stageDir -Filter '*.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
-
-        if (-not $staged) {
-            Warn "winget download did not produce a binary -- aborting update, live binary untouched"
-        } else {
-            # Smoke test BEFORE touching the live binary: an interactive-looking
-            # --version pass does not prove auth works the way this script
-            # actually invokes the binary -- run the real call it's about to use.
-            & $staged.FullName filesystem list $REMOTE_BASE 2>&1 | ForEach-Object { Log "  smoke-test: $_" }
-            if ($LASTEXITCODE -ne 0) {
-                Warn "Staged proton-drive v$latestVer failed to authenticate/list $REMOTE_BASE -- aborting update, live binary untouched"
+        # Tell the RPi's xware-update tracking table, so its weekly report stops
+        # flagging PZ13 as outstanding. Soft-fails -- an unreachable RPi must not
+        # block this backup.
+        $sshKey = Join-Path $env:USERPROFILE '.ssh\workstation-to-rpi'
+        if (Test-Path $sshKey) {
+            & ssh -o BatchMode=yes -o ConnectTimeout=5 -i $sshKey vh@192.168.1.6 `
+                "~/xware-update-checks/xware-ack proton-drive-cli/windows-arm64 $afterVer" 2>&1 |
+                ForEach-Object { Log "  xware-ack: $_" }
+            if ($LASTEXITCODE -eq 0) {
+                Ok "RPi tracking updated: proton-drive-cli/windows-arm64 = $afterVer"
             } else {
-                Ok "Smoke-test OK: staged binary v$latestVer authenticates and lists $REMOTE_BASE"
-
-                $bakPath = "$PROTON.bak"
-                Copy-Item $PROTON $bakPath -Force
-                Copy-Item $staged.FullName $PROTON -Force
-
-                & $PROTON filesystem list $REMOTE_BASE 2>&1 | Out-Null
-                if ($LASTEXITCODE -eq 0) {
-                    Remove-Item $bakPath -Force
-                    Ok "Proton Drive CLI upgraded: $currentVer -> $latestVer"
-
-                    # Step (e): tell the RPi's tracking table, so the weekly
-                    # xware-update email stops flagging PZ13 as outstanding.
-                    # Soft-fails -- an unreachable RPi must not block this backup.
-                    $sshKey = Join-Path $env:USERPROFILE '.ssh\workstation-to-rpi'
-                    if (Test-Path $sshKey) {
-                        & ssh -o BatchMode=yes -o ConnectTimeout=5 -i $sshKey vh@192.168.1.6 `
-                            "~/xware-update-checks/xware-ack proton-drive-cli/windows-arm64 $latestVer" 2>&1 |
-                            ForEach-Object { Log "  xware-ack: $_" }
-                        if ($LASTEXITCODE -eq 0) {
-                            Ok "RPi tracking updated: proton-drive-cli/windows-arm64 = $latestVer"
-                        } else {
-                            Warn "Could not reach RPi to update its tracking -- do it by hand: ssh rpi ""~/xware-update-checks/xware-ack proton-drive-cli/windows-arm64 $latestVer"""
-                        }
-                    } else {
-                        Warn "SSH key not found at $sshKey -- update the RPi's tracking by hand: xware-ack proton-drive-cli/windows-arm64 $latestVer"
-                    }
-                } else {
-                    Warn "Post-promotion verification FAILED for v$latestVer -- rolling back to $currentVer"
-                    Copy-Item $bakPath $PROTON -Force
-                    & $PROTON filesystem list $REMOTE_BASE 2>&1 | Out-Null
-                    if ($LASTEXITCODE -eq 0) {
-                        Remove-Item $bakPath -Force
-                        Ok "Rollback to $currentVer succeeded -- proton-drive authenticating again"
-                    } else {
-                        Fail "ROLLBACK ALSO FAILED -- proton-drive CLI may be broken. Manual intervention needed. Backup copy retained at $bakPath"
-                    }
-                }
+                Warn "Could not reach the RPi -- run there by hand: ~/xware-update-checks/xware-ack proton-drive-cli/windows-arm64 $afterVer"
             }
+        } else {
+            Warn "SSH key not found at $sshKey -- run on the RPi by hand: ~/xware-update-checks/xware-ack proton-drive-cli/windows-arm64 $afterVer"
         }
-        Remove-Item $stageDir -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 
-# Quick connectivity check -- also validates Credential Manager access
+# -----------------------------------------------------------------------------
+# PRE-FLIGHT -- CONNECTION AND AUTH
+# -----------------------------------------------------------------------------
+# Any failure other than a missing remote folder must stop the run here, not
+# after building a multi-GB archive that cannot be uploaded. The CLI's error
+# wording varies ("You need to login first", "Invalid access token", ...), so
+# the check does not depend on it alone: known auth phrases fail immediately;
+# any other failure gets one create-folder attempt, then must list cleanly.
 Log "Pre-flight: verifying Proton Drive connection..."
-# Detect an invalid/expired auth token explicitly and fail fast, rather than
-# masking it as "folder doesn't exist" and burning minutes building a 365 MB
-# archive that then can't upload. proton-drive can leave a stale token (see the
-# libsecret Replace=False bug noted in the shared CLAUDE.md / BUG-REPORT).
-$authCheck  = & $PROTON filesystem list $REMOTE_BASE --json 2>&1
-$authStatus = $LASTEXITCODE
-if ($authCheck -match 'need to login|not authenticated|unauthorized') {
-    Fail "proton-drive auth token invalid/expired -- run: .\proton-drive.exe auth login (see RUNBOOK)"
-} elseif ($authStatus -ne 0) {
-    # Folder might not exist yet -- try to create it
-    Log "Remote folder not found -- attempting to create $REMOTE_BASE ..."
-    & $PROTON filesystem create-folder /my-files PZ13 2>&1 | ForEach-Object { Log $_ }
+$authPattern = 'need to login|not authenticated|unauthori|access token'
+$listOut = & $PROTON filesystem list $REMOTE_BASE 2>&1
+$listRc  = $LASTEXITCODE
+if ($listOut -match $authPattern) {
+    $listOut | ForEach-Object { Log "  list: $_" }
+    Fail "Proton Drive auth failed -- re-authenticate: & '$PROTON' auth login"
+}
+if ($listRc -ne 0) {
+    $listOut | ForEach-Object { Log "  list: $_" }
+    Log "Listing $REMOTE_BASE failed -- attempting to create it, then re-checking"
+    & $PROTON filesystem create-folder /my-files PZ13 2>&1 | ForEach-Object { Log "  create-folder: $_" }
+    $listOut = & $PROTON filesystem list $REMOTE_BASE 2>&1
+    if ($LASTEXITCODE -ne 0 -or ($listOut -match $authPattern)) {
+        $listOut | ForEach-Object { Log "  list: $_" }
+        Fail "Cannot list $REMOTE_BASE -- see the lines above. If they mention login or a token: & '$PROTON' auth login"
+    }
 }
 Ok "Proton Drive connection verified"
+}   # end: if (-not $ArchiveOnly)
 
 # -----------------------------------------------------------------------------
 # STEP 1 -- RUN AUDIT (update include/exclude manifest)
@@ -331,43 +309,67 @@ Log "Output: $BACKUP_TMP"
 
 if (Test-Path $BACKUP_TMP) { Remove-Item $BACKUP_TMP -Force }
 
-# BSD tar on Windows:
-#   -czf                  create gzip-compressed archive
-#   -C $homeDir           paths in archive are RELATIVE to home dir
-#   --exclude-from        exclusion patterns (relative to -C directory)
-#   paths passed directly as arguments (NOT via -T) -- avoids BSD tar quirk
-#   where -T causes "Couldn't visit directory" for empty path between entries.
-#
-# Archive paths will look like: Documents/file.txt  (relative to home)
-# Restore is:  tar -xzf archive.tar.gz -C $env:USERPROFILE
+# GNU tar (MSYS runtime) arguments:
+#   --force-local       an archive path like C:/... is a local file, not host:file
+#   -czf <archive>      create, gzip (gzip.exe found via the PATH set above)
+#   -C <profile>        member paths are relative to the profile (Documents/...)
+#   --exclude-from      patterns from exclude.txt
+#   include paths are passed as arguments. Paths use forward slashes.
+# Restore: GNU tar -xzf <archive> -C <profile>   (win_restore.ps1 does this)
+$homeFs    = $env:USERPROFILE -replace '\\', '/'
+$archiveFs = $BACKUP_TMP      -replace '\\', '/'
+$excludeFs = $excludeFile     -replace '\\', '/'
+$includePaths = @(Get-Content $includeFile | Where-Object { $_.Trim() -ne '' })
 
-$homeDir = $env:USERPROFILE
+function Remove-LocalArchive {
+    if (Test-Path $BACKUP_TMP) { Remove-Item $BACKUP_TMP -Force -ErrorAction SilentlyContinue }
+}
 
-# Read include paths from file; pass directly as positional arguments to tar
-$includePaths = Get-Content $includeFile | Where-Object { $_.Trim() -ne '' }
-
-$tarArgs = @(
-    '-czf', $BACKUP_TMP,
-    '-C', $homeDir,
-    '--exclude-from', $excludeFile
-) + @($includePaths)
-
-Log "Running tar..."
-$tarOutput = & tar @tarArgs 2>&1
+Log "Running GNU tar..."
+$tarOutput = & $TAR --force-local -czf $archiveFs -C $homeFs "--exclude-from=$excludeFs" @includePaths 2>&1
+$tarRc = $LASTEXITCODE
 $tarOutput | ForEach-Object { Log "  tar: $_" }
+Log "tar exit code: $tarRc"
 
-# tar exits non-zero for warnings -- log but don't abort unless archive wasn't created
+# GNU tar: 0 = OK; 1 = some file changed while being read (archive still
+# valid, warned); 2 = fatal. Anything else (e.g. a crash) is also fatal.
+if ($tarRc -ne 0 -and $tarRc -ne 1) {
+    Remove-LocalArchive
+    Fail "tar failed (exit $tarRc) -- nothing uploaded, retention not run"
+}
+if ($tarRc -eq 1) { Warn "tar exit 1: a file changed while being read (see tar lines above) -- verifying archive" }
 if (-not (Test-Path $BACKUP_TMP)) {
-    Fail "Archive was not created -- check log for tar errors"
+    Fail "Archive was not created -- nothing uploaded, retention not run"
 }
 
 $archiveSize = (Get-Item $BACKUP_TMP).Length
 $archiveSizeHR = if ($archiveSize -ge 1GB) { "{0:N1} GB" -f ($archiveSize/1GB) }
                  elseif ($archiveSize -ge 1MB) { "{0:N1} MB" -f ($archiveSize/1MB) }
                  else { "{0:N0} KB" -f ($archiveSize/1KB) }
+Log "Archive created: $BACKUP_LABEL ($archiveSizeHR, $archiveSize bytes)"
 
-Log "Archive created: $BACKUP_LABEL ($archiveSizeHR)"
-Ok "Archive: $archiveSizeHR"
+# -----------------------------------------------------------------------------
+# STEP 2b -- VERIFY THE ARCHIVE BEFORE UPLOAD
+# -----------------------------------------------------------------------------
+# Re-read every block. A truncated or damaged archive must never be uploaded:
+# the upload would count as a backup and retention would push out an older,
+# good one. (Five weeks of truncated archives were uploaded and reported
+# COMPLETE before this check existed -- see BACKUP-LOGIC.md.)
+Log "--- Step 2b: Verify archive ---"
+$verifyOut = & $TAR --force-local -tzf $archiveFs 2>&1
+$verifyRc  = $LASTEXITCODE
+$entryCount = @($verifyOut | Where-Object { "$_" -notmatch '^tar: ' }).Count
+$verifyOut | Where-Object { "$_" -match '^tar: ' } | ForEach-Object { Log "  verify: $_" }
+if ($verifyRc -ne 0) {
+    Remove-LocalArchive
+    Fail "Archive failed verification (tar -tzf exit $verifyRc) -- nothing uploaded, retention not run"
+}
+Ok "Archive verified: $entryCount entries, $archiveSize bytes ($archiveSizeHR)"
+
+if ($ArchiveOnly) {
+    Log "ArchiveOnly: stopping before upload. Archive kept for inspection: $BACKUP_TMP"
+    exit 0
+}
 
 # -----------------------------------------------------------------------------
 # STEP 3 -- UPLOAD TO PROTON DRIVE
@@ -386,7 +388,7 @@ if ($LASTEXITCODE -ne 0) {
 Ok "Upload complete: $REMOTE_BASE/$BACKUP_LABEL"
 
 # -----------------------------------------------------------------------------
-# STEP 4 -- RETENTION (keep KEEP_COUNT, delete older)
+# STEP 4 -- RETENTION (keep KEEP_COUNT, trash older, then empty trash)
 # -----------------------------------------------------------------------------
 Log "--- Step 4: Retention (keep $KEEP_COUNT) ---"
 

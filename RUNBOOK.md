@@ -1,426 +1,450 @@
-# Backup System Runbook
+# Runbook — Windows (PZ13) Proton Drive Backup
 
-Exact commands for every operational scenario.
+Exact commands for setup, the weekly check, routine changes, restore and troubleshooting.
+How it works and why: `BACKUP-LOGIC.md`.
 
----
+**Conventions**
 
-## Phase 1 -- First-Time Setup (RPi5)
+- Every command runs on PZ13.
+- **PS7** = PowerShell 7 (`pwsh`). The scripts refuse Windows PowerShell 5.1
+  (`#Requires -Version 7.0`). If a window is 5.1, type `pwsh` in it first.
+- **Admin PS7** = PS7 started with "Run as administrator", or `pwsh` typed in an elevated
+  window (it stays elevated).
+- One command per block. The expected result is stated above each block.
+- Full paths throughout; nothing depends on the current directory.
 
-### 1.1 Create directory and deploy scripts
-
-```bash
-mkdir -p ~/proton-headless-backup
-# Copy audit_backup.sh, rpi_backup.sh, rpi_restore.sh into it
-chmod +x ~/proton-headless-backup/audit_backup.sh \
-          ~/proton-headless-backup/rpi_backup.sh \
-          ~/proton-headless-backup/rpi_restore.sh
-```
-
-### 1.2 Download proton-drive CLI
-
-```bash
-curl -Lo ~/proton-headless-backup/proton-drive \
-  https://proton.me/download/drive/cli/0.4.3/linux-arm64/proton-drive
-chmod +x ~/proton-headless-backup/proton-drive
-~/proton-headless-backup/proton-drive --version
-```
-
-### 1.3 Authenticate
-
-```bash
-~/proton-headless-backup/proton-drive auth login
-~/proton-headless-backup/proton-drive filesystem list /
-```
-
-### 1.4 Create remote folder
-
-```bash
-~/proton-headless-backup/proton-drive filesystem create-folder /my-files RPi5-VH
-```
-
-### 1.5 Run manual test
-
-```bash
-~/proton-headless-backup/rpi_backup.sh
-tail -50 ~/proton-headless-backup/rpi_backup.log
-```
-
-### 1.6 Install cron job
-
-```bash
-(crontab -l 2>/dev/null; echo "0 23 * * 0 /home/vh/proton-headless-backup/rpi_backup.sh") | crontab -
-crontab -l
-```
+| Name | Path |
+|---|---|
+| Repo (scripts run from here) | `C:\Users\andre\DevSpace\z-repo\proton-drive\proton-windows-backup` |
+| Proton Drive CLI | `C:\Users\andre\AppData\Local\Microsoft\WinGet\Packages\Proton.ProtonDrive.CLI_Microsoft.Winget.Source_8wekyb3d8bbwe\proton-drive.exe` |
+| Scheduled task | `Proton Drive - Win11 PZ13 Backup` |
+| Remote folder | `/my-files/PZ13` |
 
 ---
 
-## Phase 2 -- Verify RPi Backup Running
+## Phase 1 — Setup on a New or Rebuilt Machine
 
-```bash
-# Check log for last run
-tail -20 ~/proton-headless-backup/rpi_backup.log
+On PZ13 on 2026-09-28, steps 1.3a–1.12 were run with the results shown. Steps 1.1–1.3 date
+from the original setup, or were not needed because the repo already existed. The whole
+sequence has not been run on a fresh machine.
 
-# List remote backups
-~/proton-headless-backup/proton-drive filesystem list /my-files/RPi5-VH
+### 1.1 PowerShell 7 (PS7 or Windows PowerShell)
 
-# Verify archive integrity
-~/proton-headless-backup/rpi_restore.sh check latest
-```
-
----
-
-## Phase 3 -- RPi Routine Maintenance
-
-```bash
-# Add a new path to back up
-echo "/home/vh/new-project" >> ~/proton-headless-backup/.backup-manifest/include-custom.txt
-
-# Add an exclusion pattern
-echo "*.iso" >> ~/proton-headless-backup/.backup-manifest/exclude-custom.txt
-
-# Force manual backup
-~/proton-headless-backup/rpi_backup.sh
-
-# Preview what will be included (without running backup)
-bash ~/proton-headless-backup/audit_backup.sh
-cat ~/proton-headless-backup/.backup-manifest/include.txt
-
-# What changed since last backup?
-~/proton-headless-backup/rpi_restore.sh live latest
-```
-
----
-
-## Phase 4 -- RPi Restore
-
-### 4.1 Assess
-
-```bash
-~/proton-headless-backup/rpi_restore.sh list
-~/proton-headless-backup/rpi_restore.sh check latest
-~/proton-headless-backup/rpi_restore.sh live  latest
-```
-
-### 4.2 Preview (safe -- nothing overwritten)
-
-```bash
-~/proton-headless-backup/rpi_restore.sh restore staging latest
-ls /tmp/restore-staging/
-```
-
-### 4.3 Restore specific path
-
-```bash
-~/proton-headless-backup/rpi_restore.sh restore path latest /home/vh/.ssh
-~/proton-headless-backup/rpi_restore.sh restore path latest /home/vh/ea_ps2342
-```
-
-### 4.4 Full restore (destructive)
-
-```bash
-~/proton-headless-backup/rpi_restore.sh restore full latest
-# Type YES to confirm
-```
-
-### 4.5 Post-restore
-
-```bash
-# Reinstall apt packages
-sudo apt-get install $(cat ~/proton-headless-backup/.backup-manifest/packages.txt | tr '\n' ' ')
-
-# Reinstall pip packages
-pip3 install -r ~/proton-headless-backup/.backup-manifest/pip-packages.txt
-
-# Re-authenticate Proton Drive
-~/proton-headless-backup/proton-drive auth login
-
-# Reinstall cron job
-(crontab -l 2>/dev/null; echo "0 23 * * 0 /home/vh/proton-headless-backup/rpi_backup.sh") | crontab -
-```
-
----
-
-## Phase 5 -- First-Time Setup (Windows PZ13)
-
-### 5.1 Install PowerShell 7
-
-PowerShell 7 is required. Windows ships with 5.1 but the scheduled task targets
-pwsh.exe (PS7). Install once, it coexists safely with 5.1.
+Expect `Successfully installed`, or a message that it is already installed.
 
 ```powershell
-winget install Microsoft.PowerShell
+winget install --id Microsoft.PowerShell --exact --accept-source-agreements --accept-package-agreements
 ```
 
-Open a new terminal and verify:
+In a new window, expect `PowerShell 7.x.x`.
 
 ```powershell
-pwsh --version   # should show 7.x.x
+pwsh --version
 ```
 
-### 5.2 Create directory and set execution policy
+### 1.2 Execution policy (PS7)
+
+Expect no output.
 
 ```powershell
-New-Item -ItemType Directory -Path "$env:USERPROFILE\proton-windows-backup" -Force
 Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
 ```
 
-### 5.3 Download proton-drive.exe
+### 1.3 Clone the repo (PS7) — not needed on PZ13 today
 
-Download from:
-https://proton.me/download/drive/cli/0.4.3/windows-arm64/proton-drive.exe
-Save to: C:\Users\<username>\proton-windows-backup\proton-drive.exe
+Expect `Cloning into ...` and no error.
 
 ```powershell
-# Or from PowerShell:
-Invoke-WebRequest `
-  -Uri "https://proton.me/download/drive/cli/0.4.3/windows-arm64/proton-drive.exe" `
-  -OutFile "$env:USERPROFILE\proton-windows-backup\proton-drive.exe"
+git clone https://github.com/ksstech/proton-windows-backup.git "C:\Users\andre\DevSpace\z-repo\proton-drive\proton-windows-backup"
 ```
 
-### 5.4 Copy scripts
+### 1.3a Git for Windows — provides GNU tar and gzip (PS7)
 
-Copy win_audit.ps1, win_backup.ps1, win_restore.ps1 into ~\proton-windows-backup\
-
-### 5.5 Authenticate
+Already installed on PZ13. Expect `Successfully installed`, or a message that it is already
+installed.
 
 ```powershell
-cd ~\proton-windows-backup
-.\proton-drive.exe auth login
-.\proton-drive.exe filesystem list /
+winget install --id Git.Git --exact --accept-source-agreements --accept-package-agreements
 ```
 
-### 5.6 Create remote folder
+Expect `tar (GNU tar) 1.35` or later.
 
 ```powershell
-.\proton-drive.exe filesystem create-folder /my-files PZ13
+& "C:\Program Files\Git\usr\bin\tar.exe" --version
 ```
 
-### 5.7 Run manual test
+### 1.4 Install the Proton Drive CLI (PS7)
+
+Expect `Successfully installed`. Also printed:
+- `Path environment variable modified` — winget added `%LOCALAPPDATA%\Microsoft\WinGet\Links` to the user PATH;
+- `Command line alias added: "proton-drive"`.
+
+The scripts use neither.
 
 ```powershell
-.\win_backup.ps1
+winget install --id Proton.ProtonDrive.CLI --exact --scope user --accept-source-agreements --accept-package-agreements
 ```
 
-### 5.8 Install scheduled task (requires Administrator once)
+### 1.5 Check the CLI (PS7)
 
-Open a PS7 Administrator terminal (required -- registration fails silently otherwise):
+Expect `Proton Drive CLI cli-drive@<version>`.
 
 ```powershell
-# Option A: from any existing PowerShell window
-Start-Process pwsh -Verb RunAs
-
-# Option B: Start menu -> search "pwsh" -> right-click -> Run as Administrator
+& "C:\Users\andre\AppData\Local\Microsoft\WinGet\Packages\Proton.ProtonDrive.CLI_Microsoft.Winget.Source_8wekyb3d8bbwe\proton-drive.exe" --version
 ```
 
-Then in the Administrator window:
+### 1.6 Sign in (PS7)
+
+A browser opens; sign in. Expect `Authentication successful`.
 
 ```powershell
-cd ~\proton-windows-backup
-.\win_backup.ps1 -InstallTask
+& "C:\Users\andre\AppData\Local\Microsoft\WinGet\Packages\Proton.ProtonDrive.CLI_Microsoft.Winget.Source_8wekyb3d8bbwe\proton-drive.exe" auth login
 ```
 
-This creates the task with LogonType = Interactive -- required for Credential
-Manager access. Do NOT change it to "Run whether user is logged on or not".
+### 1.7 Check access to the remote folder (PS7)
 
-The task is installed with laptop-friendly power settings: WakeToRun = True,
-DontStopIfGoingOnBatteries = True, DisallowStartIfOnBatteries = True (won't
-start a fresh run on battery, but a run started on AC finishes).
-
-### 5.9 Configure AC power plan (CRITICAL for a laptop that sleeps)
-
-The scheduled task cannot run while the CPU is asleep. On a laptop that is
-always on AC but sleeps when the screen is off, the 23:00 run is missed and a
-catch-up run gets terminated when the machine sleeps again (LastTaskResult
-0x40010004). Two settings make the AC power plan safe for scheduled backups.
-
-Run as Administrator:
+Expect the stored archives. On a new account the folder may not exist yet; the first backup
+run creates it.
 
 ```powershell
-# 1. Never sleep or hibernate while on AC power (screen may still turn off)
+& "C:\Users\andre\AppData\Local\Microsoft\WinGet\Packages\Proton.ProtonDrive.CLI_Microsoft.Winget.Source_8wekyb3d8bbwe\proton-drive.exe" filesystem list /my-files/PZ13
+```
+
+### 1.8 First backup, manual (PS7)
+
+Takes about 3–5 minutes on PZ13 (2026-09-28: 2 min 19 s, 439 MB). Expect
+`Archive verified: <n> entries, <bytes> bytes`, then at the end
+`Backup COMPLETE - win11-pz13-<date>.tar.gz`.
+
+```powershell
+& "C:\Users\andre\DevSpace\z-repo\proton-drive\proton-windows-backup\win_backup.ps1"
+```
+
+### 1.9 Install the scheduled task (Admin PS7)
+
+Expect `Scheduled task installed: 'Proton Drive - Win11 PZ13 Backup'` and
+`Script : C:\Users\andre\DevSpace\z-repo\proton-drive\proton-windows-backup\win_backup.ps1`.
+
+```powershell
+& "C:\Users\andre\DevSpace\z-repo\proton-drive\proton-windows-backup\win_backup.ps1" -InstallTask
+```
+
+### 1.10 Power settings on AC (Admin PS7)
+
+Set on PZ13 on 2026-07-22 and still in place. These do not stop the Modern Standby failures
+described in `BACKUP-LOGIC.md` ("Known Issue"). Expect no output from each command.
+
+```powershell
 powercfg /change standby-timeout-ac 0
-powercfg /change hibernate-timeout-ac 0
+```
 
-# 2. Allow wake timers on AC so WakeToRun can fire the 23:00 task
+```powershell
+powercfg /change hibernate-timeout-ac 0
+```
+
+```powershell
 powercfg /setacvalueindex SCHEME_CURRENT SUB_SLEEP RTCWAKE 1
+```
+
+```powershell
 powercfg /setactive SCHEME_CURRENT
 ```
 
-Verify:
+### 1.11 Test the scheduled path (PS7)
+
+Expect no output.
 
 ```powershell
-powercfg /query SCHEME_CURRENT SUB_SLEEP STANDBYIDLE   # AC value should be 0
-powercfg /query SCHEME_CURRENT SUB_SLEEP RTCWAKE        # AC value should be 1
+Start-ScheduledTask -TaskName 'Proton Drive - Win11 PZ13 Backup'
 ```
 
-Leaving `standby-timeout-ac 0` means the machine stays fully awake (screen off
-is fine) whenever it is plugged in, so the weekly task always fires on time.
-Battery timeouts are untouched, so unplugged behaviour is unchanged.
-
-### 5.10 Verify task
+After about 5 minutes, expect `LastTaskResult` `0`. `267009` means still running; wait and
+repeat.
 
 ```powershell
-$t = Get-ScheduledTask -TaskName 'Proton Drive - Win11 PZ13 Backup'
-$t | Select-Object TaskName, State
-$t.Settings | Format-List WakeToRun, DisallowStartIfOnBatteries, StopIfGoingOnBatteries, StartWhenAvailable
+Get-ScheduledTaskInfo -TaskName 'Proton Drive - Win11 PZ13 Backup' | Select-Object LastRunTime, LastTaskResult
 ```
 
----
+### 1.12 Check the log (PS7)
 
-## Phase 6 -- Windows Routine Maintenance
+Expect the last lines to include `Backup COMPLETE`.
 
 ```powershell
-# Add a path to back up
-Add-Content "$env:USERPROFILE\proton-windows-backup\.backup-manifest\include-custom.txt" "C:\MyProject"
-
-# Add an exclusion pattern
-Add-Content "$env:USERPROFILE\proton-windows-backup\.backup-manifest\exclude-custom.txt" "*.iso"
-
-# Force manual backup
-cd ~\proton-windows-backup
-.\win_backup.ps1
-
-# What changed since last backup?
-.\win_restore.ps1 live latest
-
-# View log
-Get-Content ~\proton-windows-backup\win_backup.log | Select-Object -Last 100
+Get-Content "C:\Users\andre\DevSpace\z-repo\proton-drive\proton-windows-backup\win_backup.log" -Tail 30
 ```
 
 ---
 
-## Phase 7 -- Windows Restore
+## Phase 2 — Weekly Check (Monday, PS7)
 
-### 7.1 Assess
+No external monitor is configured; these checks are the only way a missed run is noticed.
+
+Expect `LastRunTime` on or after Sunday 23:00 and `LastTaskResult` `0`.
 
 ```powershell
-cd ~\proton-windows-backup
-.\win_restore.ps1 list
-.\win_restore.ps1 check latest
-.\win_restore.ps1 live  latest
+Get-ScheduledTaskInfo -TaskName 'Proton Drive - Win11 PZ13 Backup' | Select-Object LastRunTime, LastTaskResult, NextRunTime
 ```
 
-### 7.2 Preview (safe)
+Expect a UTC timestamp from within the last 7 days.
 
 ```powershell
-.\win_restore.ps1 restore staging latest
-Get-ChildItem $env:TEMP\restore-staging
+Get-Content "C:\Users\andre\DevSpace\z-repo\proton-drive\proton-windows-backup\.last_success"
 ```
 
-### 7.3 Restore specific path
+Expect five archives, the newest from this week.
 
 ```powershell
-.\win_restore.ps1 restore path latest .ssh
-.\win_restore.ps1 restore path latest Documents\Projects
+& "C:\Users\andre\DevSpace\z-repo\proton-drive\proton-windows-backup\win_restore.ps1" list
 ```
 
-### 7.4 Full restore (destructive)
+If the run failed, look up `LastTaskResult` under Troubleshooting, then run 1.8 manually so
+the week is not lost.
+
+---
+
+## Phase 3 — Routine Changes
+
+### 3.1 Back up an extra path
+
+Add one absolute path per line to
+`C:\Users\andre\DevSpace\z-repo\proton-drive\proton-windows-backup\.backup-manifest\include-custom.txt`,
+then commit it. It is tracked in git.
+
+Preview what the next run will include (PS7). Expect a report ending with the include count
+and the manifest paths.
 
 ```powershell
-.\win_restore.ps1 restore full latest
-# Type YES to confirm
+& "C:\Users\andre\DevSpace\z-repo\proton-drive\proton-windows-backup\win_audit.ps1"
 ```
 
-### 7.5 Post-restore
+### 3.2 Exclude a pattern
+
+Add one pattern per line to `.backup-manifest\exclude-custom.txt` in the repo, then commit
+it. Use tar glob syntax, relative to the profile, with forward slashes (`Documents/Big`,
+`*.psd`). Currently: `espressif/sdks` (the ESP-IDF clones). Check the result with 3.3.
+
+### 3.3 Test a change without uploading (PS7)
+
+Runs audit, archive and verify only; no Proton Drive access. Takes about 1 minute. Expect
+4 PASS and `PASS 4  FAIL 0`. Results: `tests\results\backup-local-<run>.txt`.
 
 ```powershell
-# Reinstall applications
-winget import -i ~\proton-windows-backup\.backup-manifest\winget-export.json --accept-source-agreements
+pwsh -NoProfile -File "C:\Users\andre\DevSpace\z-repo\proton-drive\proton-windows-backup\tests\Run-Tests.ps1" -Suite backup-local
+```
 
-# Reinstall pip packages
-pip install -r ~\proton-windows-backup\.backup-manifest\pip-packages.txt
+### 3.4 Test restore against Proton Drive (Admin PS7)
 
-# Re-authenticate Proton Drive
-~\proton-windows-backup\proton-drive.exe auth login
+Read-only on Proton Drive. Downloads the newest and oldest archives to `%TEMP%` (up to about
+3.5 GB) and removes them afterwards. Takes about 10 minutes. If a backup task is running it
+waits for it first. Expect `PASS 8  FAIL 0`. Results:
+`tests\results\restore-remote-<run>.txt`.
 
-# Reinstall scheduled task (as Administrator)
-~\proton-windows-backup\win_backup.ps1 -InstallTask
+```powershell
+pwsh -NoProfile -File "C:\Users\andre\DevSpace\z-repo\proton-drive\proton-windows-backup\tests\Run-Tests.ps1" -Suite restore-remote -AllowRemote
+```
+
+### 3.5 Change a script
+
+Edit it in the repo, run 3.3, then 1.8 or 1.11, then commit and push. There is no deploy
+step: the repo is what runs. Do not leave the repo mid-rebase or on another commit over a
+Sunday night.
+
+### 3.6 CLI version and manual upgrade (PS7)
+
+Every backup run upgrades the CLI; this is only needed to do it by hand.
+
+Expect `No available upgrade found.` or `Successfully installed`.
+
+```powershell
+winget upgrade --id Proton.ProtonDrive.CLI --exact --scope user --accept-source-agreements --accept-package-agreements
+```
+
+### 3.7 Roll the CLI back to an older version (PS7)
+
+Tested 2026-09-28 (0.8.0 → 0.7.0). Works only while Proton still publishes the version. The
+next backup run upgrades it again.
+
+Expect a list of versions.
+
+```powershell
+winget show --id Proton.ProtonDrive.CLI --versions
+```
+
+Replace `0.7.0` with the version you want. Expect `Successfully installed`.
+
+```powershell
+winget install --id Proton.ProtonDrive.CLI --exact --scope user --version 0.7.0 --force --accept-source-agreements --accept-package-agreements
+```
+
+### 3.8 Re-authenticate (PS7)
+
+Needed when a run stops with `Proton Drive auth failed`, or the CLI prints
+`Invalid access token` or `You need to login first`. Expect `Authentication successful`.
+
+```powershell
+& "C:\Users\andre\AppData\Local\Microsoft\WinGet\Packages\Proton.ProtonDrive.CLI_Microsoft.Winget.Source_8wekyb3d8bbwe\proton-drive.exe" auth login
+```
+
+### 3.9 Remove the scheduled task (Admin PS7)
+
+Expect `Scheduled task 'Proton Drive - Win11 PZ13 Backup' removed.`
+
+```powershell
+& "C:\Users\andre\DevSpace\z-repo\proton-drive\proton-windows-backup\win_backup.ps1" -RemoveTask
+```
+
+---
+
+## Restore Procedure (PS7)
+
+`<backup>` is `latest`, a date such as `2026-09-28`, or a full filename. The first command
+that needs an archive downloads it to `%TEMP%` (439 MB for 2026-09-28; about 2–3 GB for the
+older, truncated archives); later commands reuse it. All commands use GNU tar from Git for
+Windows.
+Delete it when finished (R.8). For each command's test status see `BACKUP-LOGIC.md`
+("Test Status").
+
+### R.1 What is stored
+
+Expect a table of archives with size and date.
+
+```powershell
+& "C:\Users\andre\DevSpace\z-repo\proton-drive\proton-windows-backup\win_restore.ps1" list
+```
+
+### R.2 Check the archive is readable
+
+Expect `Archive is intact -- <n> entries`.
+
+```powershell
+& "C:\Users\andre\DevSpace\z-repo\proton-drive\proton-windows-backup\win_restore.ps1" check latest
+```
+
+### R.3 Preview without changing anything
+
+Expect `Extracted to: C:\Users\andre\AppData\Local\Temp\restore-staging` and its top-level
+folders.
+
+```powershell
+& "C:\Users\andre\DevSpace\z-repo\proton-drive\proton-windows-backup\win_restore.ps1" restore staging latest
+```
+
+### R.4 Restore one file or folder
+
+Paths are relative to the profile. `browse latest <text>` shows exact paths. You are asked
+to confirm if the target exists. Expect `<n> file(s) restored to ...`.
+
+```powershell
+& "C:\Users\andre\DevSpace\z-repo\proton-drive\proton-windows-backup\win_restore.ps1" restore path latest .gitconfig
+```
+
+### R.5 Full restore (overwrites)
+
+Type `YES` when asked. Expect `Archive extracted.` and a list of post-restore steps.
+
+```powershell
+& "C:\Users\andre\DevSpace\z-repo\proton-drive\proton-windows-backup\win_restore.ps1" restore full latest
+```
+
+### R.6 Reinstall packages
+
+Preview first: expect `winget export found (...)` and `pip-packages.txt found`; nothing is
+installed.
+
+```powershell
+& "C:\Users\andre\DevSpace\z-repo\proton-drive\proton-windows-backup\win_restore.ps1" restore packages latest -DryRun
+```
+
+Then for real: shows the archived winget list and asks before installing, then the same for
+pip. Not yet run with the current script.
+
+```powershell
+& "C:\Users\andre\DevSpace\z-repo\proton-drive\proton-windows-backup\win_restore.ps1" restore packages latest
+```
+
+### R.7 Scheduled task after a rebuild
+
+Run Phase 1 steps 1.4–1.11.
+
+### R.8 Remove restore files from %TEMP%
+
+Change the date to the archive you downloaded. Expect no output.
+
+```powershell
+Remove-Item "$env:TEMP\win11-pz13-2026-09-28.tar.gz" -Force
+```
+
+Expect no output.
+
+```powershell
+Remove-Item "$env:TEMP\restore-staging" -Recurse -Force
 ```
 
 ---
 
 ## Troubleshooting
 
-### gnome-keyring WARNING (Linux)
+### Task result codes seen on PZ13
 
-```
-WARNING ** : g_main_context_push_thread_default: already registered
-```
+| `LastTaskResult` | Hex | Meaning |
+|---|---|---|
+| 0 | 0x0 | Success |
+| 267009 | 0x41301 | Still running |
+| 2147942402 | 0x80070002 | File not found. 2026-07-12: the task called `pwsh.exe` without a path. Fixed; `-InstallTask` registers the full path |
+| 1073807364 | 0x40010004 | Process terminated. 2026-07-20, during a catch-up run |
+| 267014 | 0x41306 | Task terminated. See `../history/scheduled-task-missed-runs.md` |
+| 2147943467 | 0x8007042B | Process terminated unexpectedly. 2026-09-28, the Modern Standby known issue |
 
-Benign -- backup still completes. Root cause is inside proton-drive's libsecret
-call. No action needed unless SolarWinds/PaperTrail is alerting on it, in which
-case add an rsyslog discard rule.
+For any failure: run 1.8 manually so the week is covered, then check the log.
 
-### proton-drive cannot authenticate (Linux, cron)
+### "cannot be run because it contained a #requires statement for ... 7.0"
 
-```bash
-# Verify D-Bus is running
-ls /run/user/$(id -u)/bus
+The window is Windows PowerShell 5.1. Type `pwsh` and run the command again.
 
-# If missing, manually export (already in rpi_backup.sh but useful for debugging)
-export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u)/bus"
-export GNOME_KEYRING_CONTROL="/run/user/$(id -u)/keyring"
-~/proton-headless-backup/proton-drive filesystem list /
-```
+### "Register-ScheduledTask : Access is denied"
 
-### -InstallTask fails with "Access is denied"
+`-InstallTask` needs Admin PS7.
 
-`Register-ScheduledTask` requires Administrator. The script will report `[ERR]`
-and exit. Open a PS7 Administrator terminal and retry:
+### Log shows "Proton Drive auth failed", or the CLI prints "Invalid access token"
 
-```powershell
-Start-Process pwsh -Verb RunAs
-# In the new window:
-cd ~\proton-windows-backup
-.\win_backup.ps1 -InstallTask
-```
+Run 3.8, then 1.8.
 
-### Windows backup task never ran
+### "GNU tar/gzip not found in C:\Program Files\Git\usr\bin"
 
-Check Task Scheduler history. Most likely cause: LogonType is Batch (Session 0).
+Git for Windows is missing or was moved. Run 1.3a, then 1.8.
 
-```powershell
-# Fix by reinstalling
-cd ~\proton-windows-backup
-.\win_backup.ps1 -RemoveTask
-.\win_backup.ps1 -InstallTask   # run as Administrator (see above)
-```
+### "tar failed (exit <n>)" or "Archive failed verification"
 
-### PowerShell execution policy error
+Nothing was uploaded; the remote archives are unchanged. The tar messages are in the log
+lines above. Run 3.3 to reproduce without uploading; its results file shows the full tar
+output.
 
-```
-cannot be loaded because running scripts is disabled on this system
-```
+### "Upload failed"
 
-```powershell
-Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
-```
+The archive is kept in `%TEMP%`. Re-run 1.8; it rebuilds and uploads.
 
-### pwsh not found / PS7 not installed
+### "running scripts is disabled on this system"
 
-```
-The term 'pwsh' is not recognized
-```
-
-```powershell
-winget install Microsoft.PowerShell
-# Open new terminal, retry
-```
-
-### Upload fails mid-transfer (both platforms)
-
-Archive stays in /tmp (Linux) or %TEMP% (Windows). Simply re-run the backup --
-the -f replace flag overwrites the partial upload without prompting.
+Run 1.2.
 
 ---
 
-## Quick Reference
+## Quick Reference — Key Paths
 
-| Task | Linux | Windows |
-|------|-------|---------|
-| Run backup now | `~/proton-headless-backup/rpi_backup.sh` | `.\win_backup.ps1` |
-| View log | `tail -100 ~/proton-headless-backup/rpi_backup.log` | `Get-Content ~\proton-windows-backup\win_backup.log -Tail 100` |
-| List remote | `rpi_restore.sh list` | `.\win_restore.ps1 list` |
-| Check archive | `rpi_restore.sh check latest` | `.\win_restore.ps1 check latest` |
-| Full restore | `rpi_restore.sh restore full latest` | `.\win_restore.ps1 restore full latest` |
-| Re-auth | `proton-drive auth login` | `.\proton-drive.exe auth login` |
-| Cron/Task | `0 23 * * 0 .../rpi_backup.sh` | `win_backup.ps1 -InstallTask` |
+| Item | Path |
+|---|---|
+| Scripts | `C:\Users\andre\DevSpace\z-repo\proton-drive\proton-windows-backup\win_*.ps1` |
+| Backup log | `...\proton-windows-backup\win_backup.log` |
+| Restore log | `...\proton-windows-backup\win_restore.log` |
+| Last success (UTC) | `...\proton-windows-backup\.last_success` |
+| Manifest (generated) | `...\proton-windows-backup\.backup-manifest\` |
+| Your include/exclude lists | `...\proton-windows-backup\.backup-manifest\include-custom.txt`, `exclude-custom.txt` |
+| CLI binary | `C:\Users\andre\AppData\Local\Microsoft\WinGet\Packages\Proton.ProtonDrive.CLI_Microsoft.Winget.Source_8wekyb3d8bbwe\proton-drive.exe` |
+| CLI alias (not used by the scripts) | `C:\Users\andre\AppData\Local\Microsoft\WinGet\Links\proton-drive.exe` |
+| Auth token | Credential Manager, `ch.proton.drive/drive-sdk-cli/auth-session` |
+| Archive while being built | `%TEMP%\win11-pz13-YYYY-MM-DD.tar.gz` (deleted after upload) |
+| Restore downloads / staging | `%TEMP%\win11-pz13-*.tar.gz`, `%TEMP%\restore-staging` |
+| Remote | `/my-files/PZ13` (5 archives kept) |
+| Archiver | `C:\Program Files\Git\usr\bin\tar.exe` (GNU tar, from Git for Windows) |
+| Test runner / results | `...\proton-windows-backup\tests\Run-Tests.ps1`, `tests\results\` |
+| RPi version tracking | `vh@192.168.1.6:~/xware-update-checks`, key `C:\Users\andre\.ssh\workstation-to-rpi` |

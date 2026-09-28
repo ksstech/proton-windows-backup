@@ -1,0 +1,14 @@
+# .backup-manifest\exclude-custom.txt (next to win_audit.ps1; tracked in git)
+# Patterns to exclude (tar glob syntax, one per line, relative to the profile,
+# forward slashes). This file is NEVER overwritten by the audit.
+#
+# Examples:
+#   Documents/LargeDataset
+#   *.psd
+#   Projects/OldArchive
+
+# ESP-IDF SDK clones (espressif\sdks\master, espressif\sdks\v5x) and the
+# espressif\sdks\esp-idf junction to v5x. Public git repositories; re-clone
+# rather than back up. Excluded 2026-09-28. The rest of espressif (soak,
+# backup-sdkmove-*) stays in the backup; espressif\build is excluded by 'build'.
+espressif/sdks

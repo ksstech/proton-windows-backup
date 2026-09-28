@@ -1,7 +1,18 @@
 # Runtime files -- never commit these
 proton-drive.exe
+proton-drive.exe.bak
+*.bak
 win_backup.log
 win_restore.log
+.last_success
+.env
 
-# Manifest directory -- auto-generated on every run
-.backup-manifest/
+# Test run results (tests\results\) -- the suites and runner are tracked
+tests/results/
+
+# Manifest directory -- auto-generated on every run.
+# Ignore everything in it EXCEPT the two hand-maintained config files,
+# which ARE tracked so a machine rebuild restores the custom include/exclude set.
+.backup-manifest/*
+!.backup-manifest/include-custom.txt
+!.backup-manifest/exclude-custom.txt
