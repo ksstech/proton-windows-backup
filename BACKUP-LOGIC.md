@@ -458,7 +458,9 @@ Suites write only to their own temp folder, which is removed afterwards; environ
 stay inside the runner's process. Suites that read Proton Drive need `-AllowRemote` and are
 read-only; the one suite that runs a real backup (upload, retention) needs `-AllowUpload`.
 Suites that need Administrator refuse to run without it. A run that is refused or
-interrupted says so in its results file.
+interrupted says so in its results file. `-SuiteDir <repo>\tests\suites` runs another repo's
+suites with this runner (results go to that repo's `tests\results`); the RPi suites in
+`../proton-headless-backup/tests/` use it and reach the RPi over SSH.
 
 | Suite | Checks | Proton Drive |
 |---|---|---|

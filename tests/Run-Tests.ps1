@@ -3,6 +3,7 @@
 #
 # USAGE (PowerShell 7; a normal window unless the suite says otherwise)
 #   pwsh -NoProfile -File <repo>\tests\Run-Tests.ps1 -Suite <name> [-AllowRemote] [-AllowUpload] [-KeepWorkDir]
+#        [-SuiteDir <other-repo>\tests\suites]   (suites of another repo, e.g. the RPi's, run over SSH)
 #
 # A suite is tests\suites\<name>.ps1. It returns a hashtable:
 #   Name, Description   text
@@ -43,15 +44,19 @@ param(
     [Parameter(Mandatory = $true)][string]$Suite,
     [switch]$AllowRemote,
     [switch]$AllowUpload,
-    [switch]$KeepWorkDir
+    [switch]$KeepWorkDir,
+    # Suites of another repo, e.g. <other-repo>\tests\suites. Results then go to
+    # <other-repo>\tests\results and $Ctx.RepoDir is <other-repo>.
+    [string]$SuiteDir = ''
 )
 
 $ErrorActionPreference = 'Continue'
 $MaxLines = 200
 
-$TestsDir   = $PSScriptRoot
+$TestsDir   = if ($SuiteDir) { Split-Path $SuiteDir -Parent } else { $PSScriptRoot }
+$SuitesDir  = if ($SuiteDir) { $SuiteDir } else { Join-Path $TestsDir 'suites' }
 $RepoDir    = Split-Path $TestsDir -Parent
-$SuiteFile  = Join-Path $TestsDir "suites\$Suite.ps1"
+$SuiteFile  = Join-Path $SuitesDir "$Suite.ps1"
 $ResultsDir = Join-Path $TestsDir 'results'
 $RunId      = Get-Date -Format 'yyyyMMdd-HHmmss'
 $WorkDir    = Join-Path $env:TEMP "pwb-tests\$Suite-$RunId"
@@ -72,7 +77,7 @@ function Stop-Run {
 }
 
 if (-not (Test-Path $SuiteFile)) {
-    $available = Get-ChildItem (Join-Path $TestsDir 'suites') -Filter *.ps1 -ErrorAction SilentlyContinue |
+    $available = Get-ChildItem $SuitesDir -Filter *.ps1 -ErrorAction SilentlyContinue |
                  ForEach-Object BaseName
     Stop-Run "Suite not found: $SuiteFile. Available: $($available -join ', ')"
 }
