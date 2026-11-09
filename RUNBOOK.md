@@ -400,7 +400,7 @@ Remove-Item "$env:TEMP\restore-staging" -Recurse -Force
 |---|---|---|
 | 0 | 0x0 | Success |
 | 267009 | 0x41301 | Still running |
-| 2147942402 | 0x80070002 | File not found. 2026-07-12: the task called `pwsh.exe` without a path. Fixed; `-InstallTask` registers the full path |
+| 2147942402 | 0x80070002 | File not found. 2026-07-12: the task called `pwsh.exe` without a path. Fixed; `-InstallTask` registers the full path. Seen 2026-11-09: the task named the Store build's versioned folder, which a PowerShell update removed. Fixed by the MSI build, `C:\Program Files\PowerShell\7\pwsh.exe`; see `BACKUP-LOGIC.md` "The task" |
 | 1073807364 | 0x40010004 | Process terminated. 2026-07-20, during a catch-up run |
 | 267014 | 0x41306 | Task terminated. See `../history/scheduled-task-missed-runs.md` |
 | 2147943467 | 0x8007042B | Process terminated unexpectedly. 2026-09-28, under the old schedule; see `BACKUP-LOGIC.md` "Modern Standby" |

@@ -351,8 +351,15 @@ decides.
 | StopIfGoingOnBatteries | False | a started run finishes |
 | MultipleInstances | IgnoreNew | |
 
-If PowerShell 7 is installed under `C:\Program Files\WindowsApps\`, that path contains the
-version. After a PowerShell upgrade, re-run `-InstallTask` if the task stops starting (check
+PowerShell 7 on PZ13 is the MSI build (since 2026-11-09): `C:\Program Files\PowerShell\7\pwsh.exe`.
+That path has no version, so a PowerShell upgrade does not change it. The Microsoft Store (MSIX)
+build installs under `C:\Program Files\WindowsApps\Microsoft.PowerShell_<version>_...\`; that
+path changes at every update. It broke the task (`0x80070002`): the task still named 7.6.6.0,
+and 7.6.9.0 replaced it on 2026-10-25. The Task Scheduler log shows the failure from
+2026-11-03, where the log starts; the last backup was 2026-10-11. Do not install the Store build on PZ13. Install
+the MSI build with
+`winget install --id Microsoft.PowerShell --installer-type wix --architecture arm64 --scope machine`.
+If the task stops starting anyway, re-run `-InstallTask` (check
 `LastTaskResult`, RUNBOOK Troubleshooting).
 
 PowerShell 7 is required: all scripts start with `#Requires -Version 7.0`, so Windows
